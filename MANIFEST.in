@@ -1,0 +1,15 @@
+# Controls what goes into the source distribution (sdist).
+# The wheel only contains the autodevloop/ package (see pyproject [tool.setuptools]).
+include LICENSE
+include README.md
+include README.zh-CN.md
+include CONTRIBUTING.md
+include pyproject.toml
+recursive-include autodevloop py.typed
+
+# Never ship local/dev junk in the sdist.
+prune tests
+prune .github
+prune .claude
+prune .pytest_cache
+global-exclude __pycache__ *.py[cod] *.tmp .DS_Store Thumbs.db

@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "autodevloop"
+version = "0.1.0"
+description = "AI-driven autonomous software iteration loop: set a goal, let CLI coding agents architect, build, test, review and evolve a project version by version."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "AutoDevLoop contributors" }]
+keywords = ["ai", "agents", "automation", "claude", "codegen", "autonomous", "iteration"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Code Generators",
+]
+# Zero required runtime dependencies; PyYAML is optional (a fallback parser ships).
+dependencies = []
+
+[project.optional-dependencies]
+yaml = ["PyYAML>=6.0"]
+dev = ["pytest>=7.0"]
+
+[project.urls]
+Homepage = "https://github.com/selavieWp/autodevloop"
+Repository = "https://github.com/selavieWp/autodevloop"
+Issues = "https://github.com/selavieWp/autodevloop/issues"
+
+[project.scripts]
+autodevloop = "autodevloop.cli:main"
+
+[tool.setuptools]
+packages = ["autodevloop"]
+
+[tool.setuptools.package-data]
+autodevloop = ["py.typed"]

@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+venv/
+.env
+.pytest_cache/
+
+# AutoDevLoop runtime artifacts (per-project)
+.autodev/
+# Generated project trees produced during local testing
+_smoke/
+current/
+versions/
+
+# Secrets — never commit PyPI tokens / credentials
+.pypirc
+*.token
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.tmp
+.claude/ 
