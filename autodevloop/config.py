@@ -75,6 +75,7 @@ def default_config() -> dict[str, Any]:
             "goal": "",
             "max_versions": DEFAULT_MAX_VERSIONS,
             "arch_hint": "",
+            "brainstorm": False,    # interactive design Q&A before the run
         },
         "provider": {
             "name": "claude",

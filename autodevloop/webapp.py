@@ -131,11 +131,53 @@ def _create_project(payload: dict[str, Any]) -> dict[str, Any]:
         overrides["provider"]["command"] = payload["provider_command"]
     if payload.get("model"):
         overrides["provider"]["model"] = payload["model"]
+    overrides["project"]["brainstorm"] = bool(payload.get("brainstorm"))
     save_config(root, deep_merge(config, {k: v for k, v in overrides.items() if v}))
     (root / APP_DIR).mkdir(parents=True, exist_ok=True)
     prompts.ensure_templates(root / APP_DIR)
     registry.register(root, str(payload.get("name") or root.name))
-    return {"ok": True, "dir": str(root)}
+    return {"ok": True, "dir": str(root), "brainstorm": bool(payload.get("brainstorm"))}
+
+
+def _brainstorm_turn(payload: dict[str, Any]) -> dict[str, Any]:
+    """Run one brainstorming turn for the web UI (1 request == 1 LLM turn).
+
+    The client sends the user's latest ``reply`` (empty on the first call); the
+    server records it, asks the model for the next question, and persists the
+    transcript to ``.autodev/brainstorm.json``. When the design is ready, the
+    refined goal + arch hint are written back into the project config.
+    """
+    from . import brainstorm
+    from .config import provider_invocation
+    raw_dir = str(payload.get("dir") or "").strip()
+    if not raw_dir:
+        return {"ok": False, "error": "dir required"}
+    root = Path(raw_dir).expanduser().resolve()
+    app_dir = root / APP_DIR
+    app_dir.mkdir(parents=True, exist_ok=True)
+    config = load_config(root)
+    goal = str(payload.get("goal") or deep_get(config, "project.goal", "")).strip()
+    session = brainstorm.load_session(app_dir, goal)
+    session["goal"] = session.get("goal") or goal
+
+    reply_text = str(payload.get("reply") or "").strip()
+    if reply_text:
+        brainstorm.record_reply(app_dir, session, reply_text)
+    try:
+        result = brainstorm.next_turn(provider_invocation(config), root, app_dir, session)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)}
+
+    if result.get("done"):
+        refined_goal, spec, arch_hint = brainstorm.finalize(root, session)
+        merged: dict[str, Any] = {"project": {"goal": refined_goal}}
+        if arch_hint:
+            existing = deep_get(config, "project.arch_hint", "")
+            merged["project"]["arch_hint"] = f"{existing}\n{arch_hint}".strip() if existing else arch_hint
+        save_config(root, deep_merge(config, merged))
+        return {"ok": True, "done": True, "refined_goal": refined_goal, "spec": spec}
+    return {"ok": True, "done": False, "question": result.get("question", ""),
+            "choices": result.get("choices") or [], "turn": session.get("turns", 0)}
 
 
 def _start_run(payload: dict[str, Any]) -> dict[str, Any]:
@@ -312,6 +354,8 @@ class Handler(BaseHTTPRequestHandler):
         body = self._read_body()
         if path == "/api/create":
             return _json_response(self, _create_project(body))
+        if path == "/api/brainstorm":
+            return _json_response(self, _brainstorm_turn(body))
         if path == "/api/start":
             return _json_response(self, _start_run(body))
         if path == "/api/stop":
@@ -541,10 +585,28 @@ label{display:block;margin:11px 0 5px;color:var(--muted);font-size:12px;font-wei
       <div><label id="lPcmd"></label><input id="f_pcmd" placeholder="claude"></div>
     </div>
     <label id="lArch"></label><input id="f_hint">
+    <label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-top:11px">
+      <input type="checkbox" id="f_brainstorm" style="width:auto;margin:0"> <span id="lBrain"></span>
+    </label>
     <div class="hint" id="mTip"></div>
     <div style="margin-top:18px;display:flex;gap:8px;justify-content:flex-end">
       <button class="sec" onclick="closeNew()" id="bCancel"></button>
       <button onclick="createProject()" id="bCreate"></button>
+    </div>
+  </div>
+</div>
+
+<div class="modal" id="bsModal">
+  <div class="box">
+    <h3 id="bsTitle"></h3>
+    <div class="muted" id="bsDesc" style="font-size:12px;margin-bottom:8px"></div>
+    <div id="bsLog" style="max-height:50vh;overflow:auto;display:flex;flex-direction:column;gap:8px;margin-bottom:10px"></div>
+    <div id="bsInputWrap" style="display:none">
+      <textarea id="bsReply" style="min-height:60px"></textarea>
+      <div style="margin-top:10px;display:flex;gap:8px;justify-content:flex-end">
+        <button class="sec" onclick="bsFinish()" id="bsDone"></button>
+        <button onclick="bsSend()" id="bsSendBtn"></button>
+      </div>
     </div>
   </div>
 </div>
@@ -584,6 +646,10 @@ const I18N = {
     mTitle:"Create a project",mDesc:"This only creates the project. Edit settings first, then press Run on the dashboard.",
     lDir:"Project directory (absolute path)",lName:"Project name",lGoal:"Goal / requirement",lVer:"Max versions",lMode:"Mode",
     lProv:"Provider",lPcmd:"Provider command (optional)",lArch:"Architecture hint (optional)",
+    lBrain:"Brainstorm the design first (interactive Q&A)",
+    bsTitle:"Brainstorm the design",bsDesc:"The AI asks one question at a time. Answer them to refine the goal before the run.",
+    bsAI:"AI",bsYou:"You",bsThinking:"thinking…",bsAgreed:"Design agreed — saved to docs/brainstorm-spec.md.",
+    bsSend:"Send",bsDone:"Finish now",bsPlaceholder:"Type your answer…",bsFinishMsg:"Finish now with what we have.",
     mTip:"The provider CLI must already be installed and authenticated locally. No API key is entered here.",
     cancel:"Cancel",create:"Create",on:"on",off:"off",confirmImmediate:"Discard the current unfinished version and roll back to the last completed version?",
     st_running:"running",st_completed:"completed",st_failed:"failed",st_stopped:"stopped",st_initialized:"not started",st_unknown:"unknown",
@@ -653,6 +719,10 @@ const I18N = {
     mTitle:"新建项目",mDesc:"这里只会创建项目，不会立即运行。先去设置里调整参数，再到总览页点击「运行」。",
     lDir:"项目目录（绝对路径）",lName:"项目名称",lGoal:"目标 / 需求",lVer:"最大版本数",lMode:"模式",
     lProv:"Provider",lPcmd:"Provider 命令（可选）",lArch:"架构提示（可选）",
+    lBrain:"先头脑风暴梳理设计（交互式问答）",
+    bsTitle:"头脑风暴梳理设计",bsDesc:"AI 每次只问一个问题。逐一回答，在开跑前把目标打磨清楚。",
+    bsAI:"AI",bsYou:"你",bsThinking:"思考中…",bsAgreed:"设计已确认——已保存到 docs/brainstorm-spec.md。",
+    bsSend:"发送",bsDone:"现在结束",bsPlaceholder:"输入你的回答…",bsFinishMsg:"用现有信息直接结束。",
     mTip:"所选 provider 的 CLI 必须已在本地安装并登录。此处不需要填写任何 API key。",
     cancel:"取消",create:"创建",on:"开",off:"关",confirmImmediate:"废弃当前未完成的版本，并回退到上一个已完成的版本？",
     st_running:"运行中",st_completed:"已完成",st_failed:"失败",st_stopped:"已停止",st_initialized:"未开始",st_unknown:"未知",
@@ -722,6 +792,10 @@ const I18N = {
     mTitle:"プロジェクト作成",mDesc:"ここでは作成のみ行い、すぐには実行しません。先に設定を調整し、ダッシュボードで「実行」を押してください。",
     lDir:"プロジェクトディレクトリ（絶対パス）",lName:"プロジェクト名",lGoal:"目標 / 要件",lVer:"最大バージョン数",lMode:"モード",
     lProv:"プロバイダ",lPcmd:"プロバイダコマンド（任意）",lArch:"アーキテクチャのヒント（任意）",
+    lBrain:"先に設計をブレインストーミング（対話式Q&A）",
+    bsTitle:"設計のブレインストーミング",bsDesc:"AI は1問ずつ質問します。回答して、実行前に目標を磨き込みます。",
+    bsAI:"AI",bsYou:"あなた",bsThinking:"考え中…",bsAgreed:"設計が決まりました — docs/brainstorm-spec.md に保存しました。",
+    bsSend:"送信",bsDone:"ここで終了",bsPlaceholder:"回答を入力…",bsFinishMsg:"今ある情報で終了してください。",
     mTip:"選択したプロバイダの CLI は事前にインストール・認証済みである必要があります。API キーの入力は不要です。",
     cancel:"キャンセル",create:"作成",on:"オン",off:"オフ",confirmImmediate:"未完成の現在のバージョンを破棄し、最後に完了したバージョンに戻しますか？",
     st_running:"実行中",st_completed:"完了",st_failed:"失敗",st_stopped:"停止",st_initialized:"未開始",st_unknown:"不明",
@@ -884,17 +958,75 @@ function openNew(){
   document.getElementById('lGoal').textContent=t('lGoal');document.getElementById('lVer').textContent=t('lVer');
   document.getElementById('lMode').textContent=t('lMode');document.getElementById('lProv').textContent=t('lProv');
   document.getElementById('lPcmd').textContent=t('lPcmd');document.getElementById('lArch').textContent=t('lArch');
+  document.getElementById('lBrain').textContent=t('lBrain');
   document.getElementById('mTip').textContent=t('mTip');
   document.getElementById('bCancel').textContent=t('cancel');document.getElementById('bCreate').textContent=t('create');
 }
 function closeNew(){document.getElementById('newModal').classList.remove('show');}
 async function createProject(){
+  const brainstorm=document.getElementById('f_brainstorm').checked;
   const payload={dir:val('f_dir'),name:val('f_name'),goal:val('f_goal'),max_versions:val('f_versions'),
-    mode:val('f_mode'),provider:val('f_provider'),provider_command:val('f_pcmd'),arch_hint:val('f_hint')};
+    mode:val('f_mode'),provider:val('f_provider'),provider_command:val('f_pcmd'),arch_hint:val('f_hint'),brainstorm};
   const res=await api('/api/create',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
-  if(res.ok){closeNew();await loadProjects();selectDir(res.dir);tab='settings';dashBuilt=false;render();}
+  if(res.ok){closeNew();await loadProjects();selectDir(res.dir);
+    if(res.brainstorm){bsOpen(res.dir);} else {tab='settings';dashBuilt=false;render();}}
   else alert(res.error||'failed');
 }
+
+// ---- Brainstorming chat (1 request == 1 LLM turn; state lives server-side) ----
+let bsDir=null;
+function bsOpen(dir){
+  bsDir=dir;
+  document.getElementById('bsModal').classList.add('show');
+  document.getElementById('bsTitle').textContent=t('bsTitle');
+  document.getElementById('bsDesc').textContent=t('bsDesc');
+  document.getElementById('bsDone').textContent=t('bsDone');
+  document.getElementById('bsSendBtn').textContent=t('bsSend');
+  document.getElementById('bsReply').placeholder=t('bsPlaceholder');
+  document.getElementById('bsLog').innerHTML='';
+  document.getElementById('bsInputWrap').style.display='none';
+  bsTurn('');
+}
+function bsClose(){document.getElementById('bsModal').classList.remove('show');tab='settings';dashBuilt=false;render();}
+function bsAppend(role,text){
+  const log=document.getElementById('bsLog');
+  const who=role==='ai'?t('bsAI'):(role==='you'?t('bsYou'):'');
+  const bg=role==='ai'?'var(--brand-soft)':(role==='you'?'var(--panel2)':'transparent');
+  const body=(who?'<b>'+who+':</b> ':'')+h(text).replace(/\n/g,'<br>');
+  log.insertAdjacentHTML('beforeend','<div style="background:'+bg+';padding:8px 10px;border-radius:9px">'+body+'</div>');
+  log.scrollTop=log.scrollHeight;
+}
+async function bsTurn(reply){
+  document.getElementById('bsInputWrap').style.display='none';
+  bsAppend('sys','<span class="muted">'+t('bsThinking')+'</span>');
+  const res=await api('/api/brainstorm',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dir:bsDir,reply})});
+  const log=document.getElementById('bsLog');if(log.lastChild)log.removeChild(log.lastChild);
+  if(!res.ok){bsAppend('ai','⚠ '+(res.error||'failed'));return;}
+  if(res.done){
+    bsAppend('ai',t('bsAgreed'));
+    if(res.spec)bsAppend('ai',res.spec);
+    log.insertAdjacentHTML('beforeend','<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:6px">'
+      +'<button class="sec" onclick="bsClose()">'+t('close')+'</button>'
+      +'<button class="ok" onclick="bsClose();doRun()">'+t('run')+'</button></div>');
+    log.scrollTop=log.scrollHeight;loadProjects();return;
+  }
+  bsAppend('ai',res.question||'');
+  if(res.choices&&res.choices.length){
+    log.insertAdjacentHTML('beforeend','<div style="display:flex;flex-wrap:wrap;gap:6px">'
+      +res.choices.map(c=>'<button class="sec" onclick="bsPick(this)">'+h(c)+'</button>').join('')+'</div>');
+    log.scrollTop=log.scrollHeight;
+  }
+  document.getElementById('bsReply').value='';
+  document.getElementById('bsInputWrap').style.display='block';
+  document.getElementById('bsReply').focus();
+}
+function bsPick(btn){document.getElementById('bsReply').value=btn.textContent;bsSend();}
+function bsSend(){
+  const r=document.getElementById('bsReply').value.trim();
+  if(!r)return;
+  bsAppend('you',r);bsTurn(r);
+}
+function bsFinish(){bsAppend('you',t('bsFinishMsg'));bsTurn('Please finalise the design now with what we have.');}
 
 async function loadProjects(){
   const d=await api('/api/projects');projects=d.projects||[];

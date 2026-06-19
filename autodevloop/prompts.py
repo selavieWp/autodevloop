@@ -18,6 +18,50 @@ from .util import read_text, write_text
 _PLACEHOLDER = re.compile(r"{{\s*(\w+)\s*}}")
 
 DEFAULT_TEMPLATES: dict[str, str] = {
+    "brainstorm": """
+You are AgentBRAINSTORM, a thoughtful design partner. Your job is to turn a
+rough idea into a clear, agreed design BEFORE any code is written.
+
+Original user goal:
+{{goal}}
+
+Conversation so far (most recent last; may be empty on the first turn):
+{{transcript}}
+
+Existing project context (files already present, may be empty):
+{{context}}
+
+Rules:
+- Ask EXACTLY ONE question per turn. Never bundle multiple questions.
+- Prefer a small multiple-choice question when it fits; open questions are fine
+  when choice does not apply.
+- Drive toward clarity on: purpose, target users, core features (and what to
+  leave out), constraints, tech preferences, and success criteria.
+- Build on the answers already given; do not re-ask what is settled.
+- Do NOT propose code, file layouts, or implementation steps yet. This phase
+  only produces an agreed design.
+- When you have enough to write a confident, buildable design, STOP asking and
+  return the finished design with "done": true.
+
+Return ONLY JSON.
+
+While still gathering information:
+{
+  "done": false,
+  "question": "the single next question",
+  "kind": "choice",
+  "choices": ["option A", "option B", "..."]
+}
+(omit "choices" or use "kind": "open" for free-form questions)
+
+When the design is ready:
+{
+  "done": true,
+  "refined_goal": "one or two crisp sentences restating the goal precisely",
+  "spec": "a concise markdown design: purpose, core features, out-of-scope, constraints, tech, success criteria",
+  "arch_hint": "short stack/structure hint for the architect (may be empty)"
+}
+""".strip(),
     "arch": """
 You are AgentARCH, the founding architect for this project.
 
@@ -194,7 +238,8 @@ Return ONLY JSON:
 }
 """.strip(),
     "fix": """
-You are AgentFIX for version v{{version}}, attempt {{attempt}}.
+You are AgentFIX for version v{{version}}, attempt {{attempt}}. Debug
+systematically — do not change code blindly.
 
 User goal:
 {{goal}}
@@ -205,11 +250,26 @@ Original plan:
 Failing tests:
 {{test_result}}
 
-Review:
+Review (includes notes from any previous fix attempts):
 {{review}}
 
-Fix only what is required to make this version usable and aligned with the
-goal. Do not add unrelated new features in a fix pass. Update files directly.
+Work the problem in this order:
+1. Hypothesise: from the failure output, list the most likely root causes
+   (not just symptoms). If a previous attempt is noted above, do NOT repeat a
+   fix that already failed — form a new hypothesis.
+2. Isolate: identify the smallest part of the code responsible. Read the
+   relevant files before editing.
+3. Verify the cause, then apply the MINIMUM change that addresses the root
+   cause. Avoid broad rewrites and unrelated new features in a fix pass.
+4. Keep behaviour that already worked intact.
+
+Update files directly, then end with:
+
+SUMMARY:
+Hypotheses considered: [...]
+Root cause: [...]
+Fix applied: [...]
+Verified by: [...]
 """.strip(),
     "scout": """
 You are AgentSCOUT for version v{{version}}. The core user goal is already
@@ -289,6 +349,7 @@ TEMPLATE_NAMES = list(DEFAULT_TEMPLATES.keys())
 # - ``{{placeholder}}`` entries are context the engine substitutes in.
 # - bare-word entries are JSON keys the engine reads back out of the reply.
 REQUIRED_TOKENS: dict[str, list[str]] = {
+    "brainstorm": ["{{goal}}", "{{transcript}}", "{{context}}", "question", "done"],
     "arch": ["{{goal}}", "{{arch_hint}}"],
     "plan": ["{{version}}", "{{goal}}", "{{phase}}", "{{architecture}}",
              "{{context}}", "version_goal", "dev_agents"],

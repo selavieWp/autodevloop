@@ -98,7 +98,19 @@ autodevloop run
 autodevloop run --project-dir ./my-app \
   --goal "Build a WeChat-like app: real-time chat plus a moments feed" \
   --max-versions 8 --mode advanced
+
+# Brainstorm the design first (interactive Q&A, then the loop runs):
+autodevloop run --project-dir ./my-app --goal "a todo CLI" --brainstorm
 ```
+
+**Brainstorm mode** (`--brainstorm`): before the autonomous loop starts, the AI
+asks you **one question at a time** to refine purpose, scope, constraints and
+success criteria — turning a rough idea into an agreed design. The transcript is
+saved to `.autodev/brainstorm.json` (so it survives interruptions and is not
+re-run on resume) and the final design to `docs/brainstorm-spec.md`; the refined
+goal then feeds the run. Type `/done` to wrap up early or `/skip` to cancel.
+It is also available as a checkbox + chat panel when creating a project in the
+web dashboard. Skipped automatically in `--non-interactive` runs.
 
 Watch / control a run:
 

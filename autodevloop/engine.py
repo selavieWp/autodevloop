@@ -51,6 +51,15 @@ def _coerce_pct(value: Any, default: int = 0) -> int:
     return max(0, min(100, int(round(n))))
 
 
+def _fix_summary(text: str, limit: int = 600) -> str:
+    """Pull AgentFIX's SUMMARY block (or a short tail) for the next attempt."""
+    if not text:
+        return ""
+    marker = text.rfind("SUMMARY:")
+    snippet = text[marker:] if marker != -1 else text
+    return snippet.strip()[:limit]
+
+
 def _file_differs(a: Path, b: Path) -> bool:
     if not b.exists():
         return True
@@ -390,9 +399,13 @@ class AutoDevLoop:
             review = self._review(version, state, plan, test_result, dev_outputs)
 
             if self._needs_fix(test_result, review):
+                prior_attempts: list[str] = []
                 for attempt in range(1, self.fix_retries + 1):
                     _log(f"[v{version}] Fix attempt {attempt}/{self.fix_retries}")
-                    self._fix(version, state, plan, test_result, review, attempt)
+                    out = self._fix(version, state, plan, test_result, review, attempt, prior_attempts)
+                    summary = _fix_summary(out)
+                    if summary:
+                        prior_attempts.append(f"Attempt {attempt}: {summary}")
                     test_result = self._test(version, state, plan, suffix=f"fix{attempt}")
                     review = self._review(version, state, plan, test_result, dev_outputs, suffix=f"fix{attempt}")
                     if not self._needs_fix(test_result, review):
@@ -674,14 +687,20 @@ class AutoDevLoop:
         return isinstance(score, int) and score < self.review_threshold
 
     def _fix(self, version: int, state: dict[str, Any], plan: dict[str, Any],
-             test_result: dict[str, Any], review: dict[str, Any], attempt: int) -> None:
+             test_result: dict[str, Any], review: dict[str, Any], attempt: int,
+             prior_attempts: list[str] | None = None) -> str:
+        # Thread earlier fix summaries in so a later attempt doesn't repeat a fix
+        # that already failed (systematic debugging — form a fresh hypothesis).
+        review_ctx = dict(review)
+        if prior_attempts:
+            review_ctx["previous_fix_attempts"] = prior_attempts
         prompt = prompts.render_template(self.app_dir, "fix", {
             "version": version, "attempt": attempt, "goal": state.get("goal", ""),
             "plan": json.dumps(plan, ensure_ascii=False, indent=2),
             "test_result": json.dumps(test_result, ensure_ascii=False, indent=2),
-            "review": json.dumps(review, ensure_ascii=False, indent=2),
+            "review": json.dumps(review_ctx, ensure_ascii=False, indent=2),
         })
-        self._call(state, f"FIX{attempt}", prompt, self.current_dir, step="FIX", agent="AgentFIX")
+        return self._call(state, f"FIX{attempt}", prompt, self.current_dir, step="FIX", agent="AgentFIX")
 
     def _assess_goal(self, version: int, state: dict[str, Any], review: dict[str, Any]) -> tuple[bool, int]:
         goal_met = bool(review.get("goal_met"))

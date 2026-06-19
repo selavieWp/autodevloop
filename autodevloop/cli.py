@@ -82,6 +82,10 @@ def _overrides_from_args(args: argparse.Namespace) -> dict[str, Any]:
         o["tests"]["timeout"] = args.test_timeout
     if getattr(args, "no_git", False):
         o["vcs"]["git"] = False
+    if getattr(args, "brainstorm", False):
+        o["project"]["brainstorm"] = True
+    if getattr(args, "no_brainstorm", False):
+        o["project"]["brainstorm"] = False
     return {k: v for k, v in o.items() if v}
 
 
@@ -112,6 +116,19 @@ def cmd_run(args: argparse.Namespace) -> None:
 
     if not goal and not (root / APP_DIR / STATE_FILE).exists():
         raise SystemExit("A goal is required. Use --goal \"...\" or run interactively.")
+
+    # Optional interactive brainstorming: refine the goal into an agreed design
+    # before the autonomous loop starts. Skipped in non-interactive mode.
+    brainstorm_on = bool(deep_get(config, "project.brainstorm", False)) and not args.no_brainstorm
+    if brainstorm_on and not args.non_interactive and goal:
+        from . import brainstorm
+        from .config import provider_invocation
+        refined_goal, arch_hint = brainstorm.run_cli_session(provider_invocation(config), root, goal)
+        goal = refined_goal or goal
+        if arch_hint:
+            existing_hint = deep_get(config, "project.arch_hint", "")
+            merged_hint = f"{existing_hint}\n{arch_hint}".strip() if existing_hint else arch_hint
+            config = deep_merge(config, {"project": {"arch_hint": merged_hint}})
 
     # Persist resolved config so the web UI and resumes see the same settings.
     save_config(root, deep_merge(config, {"project": {"name": project_name, "goal": goal, "max_versions": max_versions}}))
@@ -192,6 +209,8 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--no-git", action="store_true", help="Disable git commits/tags in current/.")
     run.add_argument("--reset", action="store_true", help="Start fresh (wipe .autodev, versions, current).")
     run.add_argument("--non-interactive", action="store_true", help="Never prompt; fail if goal missing.")
+    run.add_argument("--brainstorm", action="store_true", help="Refine the goal via an interactive design Q&A first.")
+    run.add_argument("--no-brainstorm", action="store_true", help="Skip brainstorming even if enabled in config.")
     run.set_defaults(func=cmd_run)
 
     stop = sub.add_parser("stop", help="Request a running loop to stop.")

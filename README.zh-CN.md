@@ -85,7 +85,17 @@ autodevloop run
 autodevloop run --project-dir ./my-app \
   --goal "做一个类似微信的应用：实时聊天 + 朋友圈" \
   --max-versions 8 --mode advanced
+
+# 先头脑风暴梳理设计（交互式问答，之后再开跑）：
+autodevloop run --project-dir ./my-app --goal "一个 todo 命令行工具" --brainstorm
 ```
+
+**头脑风暴模式**（`--brainstorm`）：在自动循环开始前，AI 会**每次只问一个问题**，
+逐步厘清目的、范围、约束与验收标准，把粗略的想法打磨成一份达成共识的设计。问答记录
+保存在 `.autodev/brainstorm.json`（中断不丢、续跑不会重复发问），最终设计写入
+`docs/brainstorm-spec.md`，磨好的目标随后喂给本次运行。中途可输入 `/done` 提前结束、
+`/skip` 取消。在 Web 面板创建项目时也提供「开关 + 聊天面板」。`--non-interactive`
+运行会自动跳过。
 
 查看 / 控制运行：
 
