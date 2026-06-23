@@ -13,7 +13,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import llm, prompts, registry, reporting, testing, vcs
-from .config import deep_get, load_config, provider_invocation, resolved_steps
+from .config import deep_get, load_config, provider_invocation, provider_for_agent, resolved_steps
+from . import control
 from .util import (
     APP_DIR, INTERNAL_DIRS, DOC_SUFFIXES, PROGRESS_FILE, STATE_FILE, STOP_FILE,
     collect_context, copy_tree_contents, diff_file_lists, extract_json,
@@ -185,7 +186,12 @@ class AutoDevLoop:
         _log(f"Provider: {self.provider.get('command')} ({self.provider.get('name')})")
 
         try:
-            self._ensure_architecture(state)
+            if self.steps.get("arch"):
+                self._ensure_architecture(state)
+            elif not self.architecture_path.exists():
+                write_text(self.architecture_path, "# Architecture\n\nNo dedicated architecture agent was enabled.\n")
+                state["architecture_created"] = True
+                save_json(self.state_path, state)
             while int(state["current_version"]) < int(state["max_versions"]):
                 if self.stop_path.exists():
                     state["status"] = "stopped"
@@ -214,6 +220,15 @@ class AutoDevLoop:
         finally:
             state["cost"] = self.cost
             save_json(self.state_path, state)
+            cp = control.load_checkpoint(self.app_dir)
+            if cp:
+                control.write_progress_doc(self.root, cp, state)
+            else:
+                control.write_progress_doc(self.root, {
+                    "status": state.get("status"), "version": state.get("current_version"),
+                    "phase": state.get("phase"), "last_completed_agent": "Version finalized",
+                    "next_agent": "none", "completed_steps": [],
+                }, state)
             reporting.write_final_report(self.report_path, state)
             reporting.write_features_overview(self.features_path, state)
             with self._lock:
@@ -330,7 +345,15 @@ class AutoDevLoop:
                 "started_at": now_text(), "started_ts": time.time(), "message": "calling provider",
             }
         self._emit(state, step=step, agent=agent, message="started", extra={"kind": "start"})
-        _log(f"[v{version}] [{label}] calling {self.provider.get('command')} in {cwd.name}...")
+        provider_key = {
+            "ARCH": "arch", "PLAN": "plan", "DEV": "dev", "DOC": "doc",
+            "TEST": "test", "REVIEW": "review", "FIX": "fix",
+            "GOAL_CHECK": "goal_check", "SCOUT": "scout", "EVALUATE": "evaluate",
+            "BUGFIX": "bugfix", "BUGVERIFY": "bugverify",
+        }.get(step, step.lower())
+        provider = provider_for_agent(self.config, provider_key)
+        prompt += control.render_directives(self.app_dir, version)
+        _log(f"[v{version}] [{label}] calling {provider.get('command')} ({provider.get('name')}) in {cwd.name}...")
 
         def on_status(msg: str) -> None:
             with self._lock:
@@ -340,7 +363,7 @@ class AutoDevLoop:
 
         try:
             result = llm.call(
-                self.provider, prompt, cwd,
+                provider, prompt, cwd,
                 label=label, timeout=self.agent_timeout,
                 retries=self.retries, backoff_seconds=self.backoff,
                 debug_file=debug_path, on_status=on_status,
@@ -364,21 +387,58 @@ class AutoDevLoop:
         _log(f"[v{version}] [{label}] done in {duration}s | out {result.output_tokens} tok")
         return result.text
 
+    def _isolated_workspace(self, version: int, name: str) -> Path:
+        workspace = self.work_dir / f"v{version}" / "transactions" / slugify(name)
+        safe_rmtree(workspace, self.root)
+        copy_tree_contents(self.current_dir, workspace)
+        return workspace
+
+    def _checkpoint(self, state: dict[str, Any], cp: dict[str, Any], completed: str,
+                    next_agent: str, *, snapshot: bool = True) -> None:
+        if completed:
+            done = cp.setdefault("completed_steps", [])
+            if completed not in done:
+                done.append(completed)
+            cp["last_completed_agent"] = completed
+        cp.update({
+            "run_type": "development", "status": "running",
+            "version": int(state.get("current_version", 0)) + 1,
+            "phase": state.get("phase", "build"), "next_agent": next_agent,
+        })
+        if snapshot:
+            control.snapshot_active(self.app_dir, self.current_dir)
+        control.save_checkpoint(self.app_dir, cp)
+        if completed:
+            control.mark_directives_applied(self.app_dir, int(cp["version"]), completed)
+        control.write_progress_doc(self.root, cp, state)
+        self._snapshot(state)
+
     # ----- pipeline stages -------------------------------------------------
     def _ensure_architecture(self, state: dict[str, Any]) -> None:
         if state.get("architecture_created") and self.architecture_path.exists():
             return
+        cp = control.load_checkpoint(self.app_dir)
+        if cp.get("next_agent") != "AgentARCH":
+            cp = {"run_type": "development", "version": 0, "phase": "architecture",
+                  "status": "running", "completed_steps": [], "next_agent": "AgentARCH"}
+            control.snapshot_active(self.app_dir, self.current_dir)
+        cp["status"] = "running"
+        control.save_checkpoint(self.app_dir, cp)
+        control.write_progress_doc(self.root, cp, state)
         _log("[ARCH] Designing architecture, stack, and test strategy...")
         prompt = prompts.render_template(self.app_dir, "arch", {
             "goal": state.get("goal", ""),
             "arch_hint": state.get("arch_hint", "") or "(none)",
         })
-        output = self._call(state, "ARCH", prompt, self.current_dir, step="ARCH", agent="AgentARCH")
+        workspace = self._isolated_workspace(0, "AgentARCH")
+        output = self._call(state, "ARCH", prompt, workspace, step="ARCH", agent="AgentARCH")
         write_text(self.architecture_path, output.strip() + "\n")
         state["architecture_created"] = True
         if self.use_git:
             vcs.commit_all(self.current_dir, "chore: initial architecture")
         save_json(self.state_path, state)
+        control.mark_directives_applied(self.app_dir, 0, "AgentARCH")
+        control.clear_checkpoint(self.app_dir)
 
     def _run_version(self, version: int, state: dict[str, Any]) -> dict[str, Any]:
         _log("=" * 60)
@@ -387,38 +447,110 @@ class AutoDevLoop:
                    message=f"v{version} · {state.get('phase')} phase",
                    extra={"kind": "version_start", "vno": version, "phase": state.get("phase")})
         before_dir = self.work_dir / f"v{version}" / "_before"
-        safe_rmtree(before_dir, self.root)
-        copy_tree_contents(self.current_dir, before_dir)
+        cp = control.load_checkpoint(self.app_dir)
+        resuming = (cp.get("run_type") == "development" and int(cp.get("version", 0) or 0) == version
+                    and cp.get("status") in {"paused", "running"})
+        if resuming:
+            control.restore_active(self.app_dir, self.current_dir)
+            _log(f"[v{version}] Resuming at {cp.get('next_agent') or 'AgentPLAN'}")
+        else:
+            cp = {"run_type": "development", "version": version, "phase": state.get("phase", "build"),
+                  "status": "running", "completed_steps": [], "next_agent": "AgentPLAN"}
+            safe_rmtree(before_dir, self.root)
+            copy_tree_contents(self.current_dir, before_dir)
+            control.snapshot_active(self.app_dir, self.current_dir)
+            control.save_checkpoint(self.app_dir, cp)
+        cp["status"] = "running"
+        cp.pop("pause_reason", None)
+        control.save_checkpoint(self.app_dir, cp)
+        control.write_progress_doc(self.root, cp, state)
 
         try:
-            plan = self._plan(version, state)
-            dev_outputs = self._develop(version, state, plan, before_dir)
-            if self.steps.get("doc"):
-                dev_outputs.append(self._doc(version, state, plan))
-            test_result = self._test(version, state, plan)
-            review = self._review(version, state, plan, test_result, dev_outputs)
+            plan = cp.get("plan")
+            if not isinstance(plan, dict):
+                plan = self._plan(version, state)
+                cp["plan"] = plan
+                self._checkpoint(state, cp, "AgentPLAN", "AgentDEV")
+
+            dev_outputs = cp.get("dev_outputs")
+            if not isinstance(dev_outputs, list):
+                dev_outputs = self._develop(version, state, plan, before_dir)
+                cp["dev_outputs"] = [{k: v for k, v in item.items() if k != "output"} for item in dev_outputs]
+                dev_names = [str(item.get("name") or "AgentDEV") for item in dev_outputs]
+                completed_dev = dev_names[0] if len(dev_names) == 1 else "DEV batch: " + ", ".join(dev_names)
+                self._checkpoint(state, cp, completed_dev, "AgentDOC" if self.steps.get("doc") else "AgentTEST")
+
+            if self.steps.get("doc") and not cp.get("doc_done"):
+                doc_out = self._doc(version, state, plan)
+                dev_outputs.append({k: v for k, v in doc_out.items() if k != "output"})
+                cp["dev_outputs"] = dev_outputs
+                cp["doc_done"] = True
+                self._checkpoint(state, cp, "AgentDOC", "AgentTEST")
+
+            test_result = cp.get("test_result")
+            if not isinstance(test_result, dict):
+                test_result = self._test(version, state, plan)
+                cp["test_result"] = test_result
+                self._checkpoint(state, cp, "AgentTEST", "AgentREVIEW")
+
+            review = cp.get("review")
+            if not isinstance(review, dict):
+                review = self._review(version, state, plan, test_result, dev_outputs)
+                cp["review"] = review
+                self._checkpoint(state, cp, "AgentREVIEW", "AgentFIX" if self._needs_fix(test_result, review) else "AgentGOALCHECK")
+
+            pending_attempt = int(cp.get("fix_attempt", 0) or 0)
+            if pending_attempt and cp.get("next_agent") == "AgentTEST":
+                test_result = self._test(version, state, plan, suffix=f"fix{pending_attempt}")
+                cp["test_result"] = test_result
+                self._checkpoint(state, cp, f"AgentTEST#fix{pending_attempt}", "AgentREVIEW")
+            if pending_attempt and cp.get("next_agent") == "AgentREVIEW":
+                review = self._review(version, state, plan, test_result, dev_outputs, suffix=f"fix{pending_attempt}")
+                cp["review"] = review
+                self._checkpoint(state, cp, f"AgentREVIEW#fix{pending_attempt}",
+                                 "AgentFIX" if self._needs_fix(test_result, review) else "AgentGOALCHECK")
 
             if self._needs_fix(test_result, review):
-                prior_attempts: list[str] = []
-                for attempt in range(1, self.fix_retries + 1):
+                prior_attempts = list(cp.get("prior_fix_attempts") or [])
+                start_attempt = int(cp.get("fix_attempt", 0) or 0) + 1
+                for attempt in range(start_attempt, self.fix_retries + 1):
                     _log(f"[v{version}] Fix attempt {attempt}/{self.fix_retries}")
                     out = self._fix(version, state, plan, test_result, review, attempt, prior_attempts)
                     summary = _fix_summary(out)
                     if summary:
                         prior_attempts.append(f"Attempt {attempt}: {summary}")
+                    cp["fix_attempt"] = attempt
+                    cp["prior_fix_attempts"] = prior_attempts
+                    self._checkpoint(state, cp, f"AgentFIX#{attempt}", "AgentTEST")
                     test_result = self._test(version, state, plan, suffix=f"fix{attempt}")
+                    cp["test_result"] = test_result
+                    self._checkpoint(state, cp, f"AgentTEST#fix{attempt}", "AgentREVIEW")
                     review = self._review(version, state, plan, test_result, dev_outputs, suffix=f"fix{attempt}")
+                    cp["review"] = review
+                    self._checkpoint(state, cp, f"AgentREVIEW#fix{attempt}",
+                                     "AgentFIX" if self._needs_fix(test_result, review) else "AgentGOALCHECK")
                     if not self._needs_fix(test_result, review):
                         break
 
-            goal_met, goal_progress = self._assess_goal(version, state, review)
+            if isinstance(cp.get("goal_assessment"), dict):
+                goal_met = bool(cp["goal_assessment"].get("goal_met"))
+                goal_progress = int(cp["goal_assessment"].get("goal_progress", 0) or 0)
+            else:
+                goal_met, goal_progress = self._assess_goal(version, state, review)
+                cp["goal_assessment"] = {"goal_met": goal_met, "goal_progress": goal_progress}
+                self._checkpoint(state, cp, "AgentGOALCHECK" if self.steps.get("goal_check") else "Goal assessment",
+                                 "AgentSCOUT" if (state.get("phase") == "expand" or goal_met) and self.steps.get("scout") else "Finalize")
             review["goal_met"] = goal_met
             review["goal_progress"] = goal_progress
-        except Exception:
-            # Roll back the working copy so a resume re-runs this version cleanly.
-            # restore_working_dir keeps current/.git intact.
-            _log(f"[v{version}] Error during version; rolling back current/ from snapshot.")
-            restore_working_dir(before_dir, self.current_dir)
+        except Exception as exc:
+            # Keep every successfully committed agent and discard only the
+            # currently failing transaction. Resume starts at next_agent.
+            _log(f"[v{version}] Error during agent; restoring the last agent checkpoint.")
+            control.restore_active(self.app_dir, self.current_dir)
+            cp["status"] = "paused"
+            cp["pause_reason"] = str(exc)
+            control.save_checkpoint(self.app_dir, cp)
+            control.write_progress_doc(self.root, cp, state)
             raise
 
         state["goal_met"] = goal_met
@@ -430,7 +562,7 @@ class AutoDevLoop:
             _log(f"[v{version}] 🎯 Core goal met. Switching to EXPAND phase.")
 
         if state.get("phase") == "expand" and self.steps.get("scout"):
-            self._scout_and_evaluate(version, state, review)
+            self._scout_and_evaluate(version, state, review, cp)
 
         # snapshot + vcs
         diff = diff_file_lists(before_dir, self.current_dir)
@@ -476,6 +608,11 @@ class AutoDevLoop:
              f"{'PASS' if test_result.get('success') else 'FAIL'} | goal {goal_progress}% | "
              f"+{len(diff['added'])}/~{len(diff['changed'])} files")
         self._emit(state, step="VERSION_DONE", agent="", message=f"v{version} score {score}")
+        # Persist the completed version before removing its checkpoint. This
+        # closes the crash window between finalization and the outer loop save.
+        save_json(self.state_path, state)
+        control.clear_checkpoint(self.app_dir)
+        control.write_progress_doc(self.root, {}, state)
         return state
 
     def _plan(self, version: int, state: dict[str, Any]) -> dict[str, Any]:
@@ -501,7 +638,8 @@ class AutoDevLoop:
             "architecture": read_text(self.architecture_path, "(architecture missing)"),
             "phase_guidance": guidance, "backlog": backlog, "previous": previous, "context": context,
         })
-        raw = self._call(state, "PLAN", prompt, self.current_dir, step="PLAN", agent="AgentPLAN")
+        workspace = self._isolated_workspace(version, "AgentPLAN")
+        raw = self._call(state, "PLAN", prompt, workspace, step="PLAN", agent="AgentPLAN")
         plan = extract_json(raw, {
             "version_goal": f"Improve version {version}", "acceptance_criteria": [],
             "dev_agents": DEV_DEFAULT, "test_focus": [], "risks": [],
@@ -528,9 +666,11 @@ class AutoDevLoop:
                 "task": agent.get("task", ""),
                 "owns": ", ".join(owns) if owns else "(not restricted)",
             })
-            text = self._call(state, name, prompt, self.current_dir, step="DEV", agent=name)
+            workspace = self._isolated_workspace(version, name)
+            text = self._call(state, name, prompt, workspace, step="DEV", agent=name)
+            restore_working_dir(workspace, self.current_dir)
             return [{"name": name, "role": agent.get("role", "dev"),
-                     "workspace": str(self.current_dir), "output": text,
+                     "workspace": str(workspace), "output": text,
                      "files": list_generated_files(self.current_dir)}]
 
         specs = []
@@ -634,7 +774,8 @@ class AutoDevLoop:
                 "candidates": json.dumps(candidates, ensure_ascii=False, indent=2),
                 "context": collect_context(self.current_dir, max_bytes=40_000),
             })
-            raw = self._call(state, f"TEST{label_suffix}", prompt, self.current_dir, step="TEST", agent="AgentTEST")
+            workspace = self._isolated_workspace(version, f"AgentTEST{label_suffix}")
+            raw = self._call(state, f"TEST{label_suffix}", prompt, workspace, step="TEST", agent="AgentTEST")
             decision = extract_json(raw, {"commands": [], "reason": "fallback"})
             commands = [str(c) for c in decision.get("commands", []) if str(c).strip()]
         else:
@@ -646,10 +787,11 @@ class AutoDevLoop:
             commands = [candidates[0]["command"]] if candidates else ["__builtin_file_smoke__"]
 
         results = []
+        test_workspace = self._isolated_workspace(version, f"test-run{label_suffix}")
         for command in commands:
             _log(f"[v{version}] [TEST] {command}")
             log_path = self.logs_dir / f"v{version}{label_suffix}_test_{slugify(command)[:30]}.log"
-            results.append(testing.run_command(self.current_dir, command, self.test_timeout, log_path))
+            results.append(testing.run_command(test_workspace, command, self.test_timeout, log_path))
         success = all(r.get("success") for r in results) if results else False
         result = {"success": success, "decision": decision, "commands": commands, "results": results}
         save_json(self.tests_dir / f"v{version}{label_suffix}.json", result)
@@ -666,7 +808,8 @@ class AutoDevLoop:
             "context": collect_context(self.current_dir, max_bytes=50_000),
         })
         label = f"REVIEW_{suffix}" if suffix else "REVIEW"
-        raw = self._call(state, label, prompt, self.current_dir, step="REVIEW", agent="AgentREVIEW")
+        workspace = self._isolated_workspace(version, label)
+        raw = self._call(state, label, prompt, workspace, step="REVIEW", agent="AgentREVIEW")
         review = extract_json(raw, {
             "score": 70, "blocking": False, "goal_met": False, "goal_progress": 0,
             "issues": [], "good_points": [], "feature_summary": plan.get("version_goal", ""),
@@ -700,7 +843,10 @@ class AutoDevLoop:
             "test_result": json.dumps(test_result, ensure_ascii=False, indent=2),
             "review": json.dumps(review_ctx, ensure_ascii=False, indent=2),
         })
-        return self._call(state, f"FIX{attempt}", prompt, self.current_dir, step="FIX", agent="AgentFIX")
+        workspace = self._isolated_workspace(version, f"AgentFIX_{attempt}")
+        text = self._call(state, f"FIX{attempt}", prompt, workspace, step="FIX", agent="AgentFIX")
+        restore_working_dir(workspace, self.current_dir)
+        return text
 
     def _assess_goal(self, version: int, state: dict[str, Any], review: dict[str, Any]) -> tuple[bool, int]:
         goal_met = bool(review.get("goal_met"))
@@ -712,30 +858,42 @@ class AutoDevLoop:
             "review": json.dumps(review, ensure_ascii=False, indent=2),
             "context": collect_context(self.current_dir, max_bytes=40_000),
         })
-        raw = self._call(state, "GOALCHECK", prompt, self.current_dir, step="GOAL_CHECK", agent="AgentGOALCHECK")
+        workspace = self._isolated_workspace(version, "AgentGOALCHECK")
+        raw = self._call(state, "GOALCHECK", prompt, workspace, step="GOAL_CHECK", agent="AgentGOALCHECK")
         decision = extract_json(raw, {"goal_met": goal_met, "goal_progress": progress})
         save_json(self.reviews_dir / f"v{version}_goalcheck.json", decision)
         return bool(decision.get("goal_met", goal_met)), _coerce_pct(decision.get("goal_progress", progress), progress)
 
-    def _scout_and_evaluate(self, version: int, state: dict[str, Any], review: dict[str, Any]) -> None:
-        scout_prompt = prompts.render_template(self.app_dir, "scout", {
-            "version": version, "goal": state.get("goal", ""),
-            "review": json.dumps(review, ensure_ascii=False, indent=2),
-            "backlog": self._backlog_text(state),
-            "context": collect_context(self.current_dir, max_bytes=35_000),
-        })
-        raw = self._call(state, "SCOUT", scout_prompt, self.current_dir, step="SCOUT", agent="AgentSCOUT")
-        candidates = extract_json(raw, {"candidates": []}).get("candidates", [])
+    def _scout_and_evaluate(self, version: int, state: dict[str, Any], review: dict[str, Any],
+                            cp: dict[str, Any]) -> None:
+        candidates = cp.get("scout_candidates")
+        if not isinstance(candidates, list):
+            scout_prompt = prompts.render_template(self.app_dir, "scout", {
+                "version": version, "goal": state.get("goal", ""),
+                "review": json.dumps(review, ensure_ascii=False, indent=2),
+                "backlog": self._backlog_text(state),
+                "context": collect_context(self.current_dir, max_bytes=35_000),
+            })
+            workspace = self._isolated_workspace(version, "AgentSCOUT")
+            raw = self._call(state, "SCOUT", scout_prompt, workspace, step="SCOUT", agent="AgentSCOUT")
+            candidates = extract_json(raw, {"candidates": []}).get("candidates", [])
+            cp["scout_candidates"] = candidates
+            self._checkpoint(state, cp, "AgentSCOUT", "AgentEVALUATE" if self.steps.get("evaluate") else "Finalize")
         if not candidates:
             return
         if self.steps.get("evaluate"):
-            eval_prompt = prompts.render_template(self.app_dir, "evaluate", {
-                "goal": state.get("goal", ""),
-                "candidates": json.dumps(candidates, ensure_ascii=False, indent=2),
-                "threshold": self.value_threshold,
-            })
-            eraw = self._call(state, "EVALUATE", eval_prompt, self.current_dir, step="EVALUATE", agent="AgentEVALUATE")
-            evals = extract_json(eraw, {"evaluations": []}).get("evaluations", [])
+            evals = cp.get("evaluations")
+            if not isinstance(evals, list):
+                eval_prompt = prompts.render_template(self.app_dir, "evaluate", {
+                    "goal": state.get("goal", ""),
+                    "candidates": json.dumps(candidates, ensure_ascii=False, indent=2),
+                    "threshold": self.value_threshold,
+                })
+                workspace = self._isolated_workspace(version, "AgentEVALUATE")
+                eraw = self._call(state, "EVALUATE", eval_prompt, workspace, step="EVALUATE", agent="AgentEVALUATE")
+                evals = extract_json(eraw, {"evaluations": []}).get("evaluations", [])
+                cp["evaluations"] = evals
+                self._checkpoint(state, cp, "AgentEVALUATE", "Finalize")
             by_title = {str(e.get("title", "")).strip().lower(): e for e in evals}
         else:
             by_title = {}

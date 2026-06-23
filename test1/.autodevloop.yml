@@ -1,0 +1,105 @@
+project:
+  name: Rmd
+  goal: "# Rmd — Typora-like Markdown Editor
+
+## Purpose
+构建一个功能完整、体验流畅的桌面 Markdown 编辑器，定位为 Typora 的开源替代品。
+
+## Core Features
+### 编辑体验
+- **所见即所得（WYSIWYG）**：默认模式，基于 TipTap/ProseMirror 实现
+- **源码模式**：可切换，支持语法高亮的纯 Markdown 编辑
+- **实时渲染**：输入即时呈现格式效果，无需手动切换预览
+
+### Markdown 扩展
+- **数学公式**：LaTeX 行内/块级公式，基于 KaTeX 或 MathJax
+- **Mermaid 图表**：流程图、时序图、甘特图等，实时渲染
+- **表格**：可视化编辑，支持对齐、增删行列
+- **代码块**：语法高亮（基于 Shiki/Prism），支持 100+ 语言
+- **图片**：支持插入本地/网络图片，拖拽粘贴
+- **HTML 嵌入**：支持在 Markdown 中嵌入原始 HTML
+
+### 文件管理
+- **单文件打开**：打开/编辑/保存单个 .md 文件
+- **文件夹侧边栏**：可选展开，显示目录树，快速切换文件
+- **最近文件**：记录最近打开的文件列表
+
+### 导入导出
+- **原生格式**：.md 文件读写
+- **导出 PDF**：基于 Electron 的打印功能，保留样式
+- **导出 HTML**：生成独立 HTML 文件，内联样式
+
+### 界面与国际化
+- **UI 风格**：简洁优雅，参考 Typora 浅色主题配色
+- **中英双语**：支持界面语言切换
+- **标准菜单栏**：文件/编辑/视图/帮助等标准菜单
+
+### 其他
+- **快捷键**：标准 Markdown 快捷键（Ctrl+B 加粗、Ctrl+I 斜体等）
+- **自动保存**：可选的自动保存功能
+- **拼写检查**：基础拼写检查支持
+
+## Out of Scope (MVP)
+- 暗黑模式（后续版本）
+- 自定义主题
+- 插件系统
+- 版本控制集成
+- 多标签页（后续考虑）
+- Word/其他格式导出
+- 移动端/网页版
+
+## Constraints
+- 基于 Electron 构建，类似 Typora 的原生体验
+- 前端使用 TipTap + ProseMirror 作为 WYSIWYG 引擎
+- 后端（主进程）负责文件 I/O、菜单、原生对话框
+- UI 框架选择：React + Tailwind CSS（或类似方案）
+- 代码编辑器组件：CodeMirror 6（源码模式）
+
+## Tech Stack
+- **Runtime**: Electron
+- **Frontend**: React + TypeScript
+- **WYSIWYG Engine**: TipTap (基于 ProseMirror)
+- **Source Editor**: CodeMirror 6
+- **Math**: KaTeX
+- **Diagrams**: Mermaid.js
+- **Code Highlight**: Shiki
+- **Styling**: Tailwind CSS
+- **Build**: Vite + electron-builder
+- **i18n**: i18next
+
+## Success Criteria
+1. 能流畅打开/编辑/保存 .md 文件，无明显延迟
+2. WYSIWYG 模式下实时渲染 Markdown 格式
+3. 数学公式、Mermaid 图表、表格、代码块均正确渲染
+4. PDF/HTML 导出保留完整样式
+5. 中英文界面切换正常
+6. 文件夹侧边栏可正常展开/收起
+7. 界面风格与 Typora 相似，简洁美观"
+  max_versions: 10
+  arch_hint: Electron 主进程负责文件 I/O、菜单、原生对话框；渲染进程使用 React + TipTap 实现 WYSIWYG 编辑器，CodeMirror 6 用于源码模式。项目结构建议：main/（主进程）、renderer/（渲染进程）、shared/（共享类型与工具）、assets/（图标与样式）。
+  brainstorm: true
+provider:
+  name: claude
+  command: ""
+  model: ""
+  extra_args: []
+pipeline:
+  mode: advanced
+  steps: {}
+agents:
+  timeout: 1800
+  allow_parallel: true
+  max_parallel: 3
+  retries: 3
+  backoff_seconds: 5
+review:
+  threshold: 80
+value:
+  threshold: 65
+fix:
+  retries: 2
+tests:
+  timeout: 120
+  command: ""
+vcs:
+  git: true

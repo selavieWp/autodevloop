@@ -15,6 +15,8 @@ from . import llm, prompts
 from .util import APP_DIR, collect_context, extract_json, load_json, save_json, write_text
 
 BRAINSTORM_FILE = "brainstorm.json"
+BRAINSTORM_HISTORY_FILE = "brainstorm-history.md"
+BRAINSTORM_SPEC_FILE = "brainstorm-spec.md"
 MAX_TURNS = 12
 
 
@@ -73,6 +75,7 @@ def next_turn(provider: dict[str, Any], root: Path, app_dir: Path,
         session["done"] = True
         session["refined_goal"] = str(reply.get("refined_goal") or session.get("goal", "")).strip()
         session["spec"] = str(reply.get("spec") or "").strip()
+        session["generated_spec"] = session["spec"]
         session["arch_hint"] = str(reply.get("arch_hint") or "").strip()
         reply = {
             "done": True, "refined_goal": session["refined_goal"],
@@ -94,13 +97,51 @@ def record_reply(app_dir: Path, session: dict[str, Any], reply_text: str) -> Non
 
 
 def finalize(root: Path, session: dict[str, Any]) -> tuple[str, str, str]:
-    """Write the design spec to ``docs/`` and return (refined_goal, spec, arch_hint)."""
+    """Write the design and read-only conversation history to ``docs/``."""
     spec = str(session.get("spec") or "").strip()
     refined_goal = str(session.get("refined_goal") or session.get("goal", "")).strip()
     arch_hint = str(session.get("arch_hint") or "").strip()
     if spec:
-        write_text(root / "docs" / "brainstorm-spec.md", spec + "\n")
+        write_text(root / "docs" / BRAINSTORM_SPEC_FILE, spec + "\n")
+    history = render_history(session)
+    if history:
+        write_text(root / "docs" / BRAINSTORM_HISTORY_FILE, history)
     return refined_goal, spec, arch_hint
+
+
+def render_history(session: dict[str, Any]) -> str:
+    """Render a stable Markdown record of the Q&A and initial AI proposal."""
+    transcript = session.get("transcript") or []
+    initial_spec = str(session.get("generated_spec") or session.get("spec") or "").strip()
+    if not transcript and not initial_spec:
+        return ""
+
+    lines = [
+        "# Brainstorm history",
+        "",
+        "> Read-only record of the design conversation before development began.",
+        "",
+    ]
+    goal = str(session.get("goal") or "").strip()
+    if goal:
+        lines.extend(["## Original goal", "", goal, ""])
+    if transcript:
+        lines.extend(["## Conversation", ""])
+        ai_no = user_no = 0
+        for turn in transcript:
+            text = str(turn.get("text") or "").strip()
+            if not text:
+                continue
+            if turn.get("role") == "assistant":
+                ai_no += 1
+                heading = f"### AI · Question {ai_no}"
+            else:
+                user_no += 1
+                heading = f"### User · Answer {user_no}"
+            lines.extend([heading, "", text, ""])
+    if initial_spec:
+        lines.extend(["## Initial AI proposal", "", initial_spec, ""])
+    return "\n".join(lines).rstrip() + "\n"
 
 
 def run_cli_session(provider: dict[str, Any], root: Path, goal: str) -> tuple[str, str]:

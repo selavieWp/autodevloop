@@ -18,11 +18,12 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from . import prompts, registry
-from .config import default_config, deep_merge, load_config, save_config, deep_get
+from . import prompts, registry, control, repair
+from .config import deep_merge, load_config, save_config, deep_get
 from .util import (
     APP_DIR, PROGRESS_FILE, STATE_FILE, STOP_FILE,
-    load_json, now_text, read_text, restore_working_dir, save_json, write_text,
+    load_json, now_text, read_text, restore_working_dir, rmtree_robust,
+    save_json, write_text,
 )
 
 _RUNS: dict[str, subprocess.Popen] = {}
@@ -63,9 +64,10 @@ def _safe_within(root: Path, candidate: Path) -> bool:
 # Run process tracking
 # --------------------------------------------------------------------------- #
 def _is_running(dir_str: str) -> bool:
+    root = Path(dir_str).resolve()
     with _LOCK:
-        proc = _RUNS.get(str(Path(dir_str).resolve()))
-    return proc is not None and proc.poll() is None
+        proc = _RUNS.get(str(root))
+    return (proc is not None and proc.poll() is None) or control.persisted_process_alive(root / APP_DIR, root)
 
 
 def _kill(proc: subprocess.Popen | None) -> None:
@@ -78,6 +80,20 @@ def _kill(proc: subprocess.Popen | None) -> None:
             proc.terminate()
     except Exception:  # noqa: BLE001
         pass
+
+
+def _watch_run(root: Path, proc: subprocess.Popen, log_file: Any) -> None:
+    proc.wait()
+    try:
+        log_file.close()
+    except OSError:
+        pass
+    with _LOCK:
+        if _RUNS.get(str(root)) is proc:
+            _RUNS.pop(str(root), None)
+    meta = load_json(root / APP_DIR / control.RUN_CONTROL_FILE, {})
+    if int(meta.get("pid", 0) or 0) == proc.pid:
+        control.clear_run_control(root / APP_DIR)
     try:
         proc.kill()
     except Exception:  # noqa: BLE001
@@ -139,6 +155,44 @@ def _create_project(payload: dict[str, Any]) -> dict[str, Any]:
     return {"ok": True, "dir": str(root), "brainstorm": bool(payload.get("brainstorm"))}
 
 
+def _delete_project(payload: dict[str, Any]) -> dict[str, Any]:
+    """Delete one registered project directory after an exact-path confirmation."""
+    raw_dir = str(payload.get("dir") or "").strip()
+    if not raw_dir:
+        return {"ok": False, "error": "project directory is required"}
+    root = Path(raw_dir).expanduser().resolve()
+    if str(payload.get("confirm_dir") or "") != str(root):
+        return {"ok": False, "error": "project directory confirmation did not match"}
+
+    registered = any(
+        str(entry.get("dir") or "").strip()
+        and Path(str(entry["dir"])).expanduser().resolve() == root
+        for entry in registry.load()
+    )
+    if not registered:
+        return {"ok": False, "error": "refusing to delete an unregistered project"}
+    if _is_running(str(root)):
+        return {"ok": False, "error": "cannot delete a project while a run is active"}
+
+    package_root = Path(__file__).resolve().parents[1]
+    protected = {Path(root.anchor).resolve(), Path.home().resolve(), package_root}
+    if root in protected:
+        return {"ok": False, "error": f"refusing to delete protected directory: {root}"}
+    if root.exists() and not root.is_dir():
+        return {"ok": False, "error": "project path is not a directory"}
+
+    existed = root.exists()
+    if existed:
+        try:
+            rmtree_robust(root)
+        except OSError as exc:
+            return {"ok": False, "error": f"failed to delete project directory: {exc}"}
+    registry.remove(root)
+    with _LOCK:
+        _RUNS.pop(str(root), None)
+    return {"ok": True, "dir": str(root), "deleted": existed}
+
+
 def _brainstorm_turn(payload: dict[str, Any]) -> dict[str, Any]:
     """Run one brainstorming turn for the web UI (1 request == 1 LLM turn).
 
@@ -148,7 +202,7 @@ def _brainstorm_turn(payload: dict[str, Any]) -> dict[str, Any]:
     refined goal + arch hint are written back into the project config.
     """
     from . import brainstorm
-    from .config import provider_invocation
+    from .config import provider_for_agent
     raw_dir = str(payload.get("dir") or "").strip()
     if not raw_dir:
         return {"ok": False, "error": "dir required"}
@@ -164,13 +218,15 @@ def _brainstorm_turn(payload: dict[str, Any]) -> dict[str, Any]:
     if reply_text:
         brainstorm.record_reply(app_dir, session, reply_text)
     try:
-        result = brainstorm.next_turn(provider_invocation(config), root, app_dir, session)
+        result = brainstorm.next_turn(provider_for_agent(config, "brainstorm"), root, app_dir, session)
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": str(exc)}
 
     if result.get("done"):
         refined_goal, spec, arch_hint = brainstorm.finalize(root, session)
-        merged: dict[str, Any] = {"project": {"goal": refined_goal}}
+        # The agreed document is the actual build brief consumed by every
+        # downstream agent. The shorter refined goal remains in the session.
+        merged: dict[str, Any] = {"project": {"goal": spec or refined_goal}}
         if arch_hint:
             existing = deep_get(config, "project.arch_hint", "")
             merged["project"]["arch_hint"] = f"{existing}\n{arch_hint}".strip() if existing else arch_hint
@@ -178,6 +234,74 @@ def _brainstorm_turn(payload: dict[str, Any]) -> dict[str, Any]:
         return {"ok": True, "done": True, "refined_goal": refined_goal, "spec": spec}
     return {"ok": True, "done": False, "question": result.get("question", ""),
             "choices": result.get("choices") or [], "turn": session.get("turns", 0)}
+
+
+def _brainstorm_design(dir_str: str) -> dict[str, Any]:
+    """Return the persisted design, history and whether the design is editable."""
+    from . import brainstorm
+
+    root = Path(dir_str).expanduser().resolve()
+    app_dir = root / APP_DIR
+    session = brainstorm.load_session(app_dir)
+    spec = str(session.get("spec") or "").strip()
+    if not spec:
+        spec = read_text(root / "docs" / brainstorm.BRAINSTORM_SPEC_FILE).strip()
+    history_path = root / "docs" / brainstorm.BRAINSTORM_HISTORY_FILE
+    history = read_text(history_path).strip()
+    # Backfill history for brainstorms completed before history documents were
+    # introduced. The JSON transcript already contains everything we need.
+    if not history:
+        rendered_history = brainstorm.render_history(session)
+        if rendered_history:
+            write_text(history_path, rendered_history)
+            history = rendered_history.strip()
+    state = load_json(app_dir / STATE_FILE, {})
+    progress = load_json(app_dir / PROGRESS_FILE, {})
+    has_run = bool(state) or bool(progress.get("run_started_at"))
+    return {
+        "ok": True,
+        "exists": bool(spec),
+        "spec": spec,
+        "history": history,
+        "editable": bool(spec) and not has_run and not _is_running(str(root)),
+        "has_run": has_run,
+    }
+
+
+def _save_brainstorm_design(payload: dict[str, Any]) -> dict[str, Any]:
+    """Persist a user-edited final design before the first project run."""
+    from . import brainstorm
+
+    raw_dir = str(payload.get("dir") or "").strip()
+    spec = str(payload.get("spec") or "").strip()
+    if not raw_dir:
+        return {"ok": False, "error": "project directory is required"}
+    if not spec:
+        return {"ok": False, "error": "design cannot be empty"}
+    root = Path(raw_dir).expanduser().resolve()
+    design = _brainstorm_design(str(root))
+    if not design.get("exists"):
+        return {"ok": False, "error": "no completed brainstorm design exists"}
+    if design.get("has_run") or _is_running(str(root)):
+        return {"ok": False, "error": "the design is read-only after the project has started"}
+
+    app_dir = root / APP_DIR
+    session = brainstorm.load_session(app_dir, deep_get(load_config(root), "project.goal", ""))
+    if not session.get("generated_spec"):
+        session["generated_spec"] = str(session.get("spec") or "").strip()
+    session["spec"] = spec
+    session["done"] = True
+    brainstorm.save_session(app_dir, session)
+    write_text(root / "docs" / brainstorm.BRAINSTORM_SPEC_FILE, spec + "\n")
+    history_path = root / "docs" / brainstorm.BRAINSTORM_HISTORY_FILE
+    if not history_path.exists():
+        history = brainstorm.render_history(session)
+        if history:
+            write_text(history_path, history)
+
+    config = load_config(root)
+    save_config(root, deep_merge(config, {"project": {"goal": spec}}))
+    return {"ok": True, "spec": spec, "editable": True}
 
 
 def _start_run(payload: dict[str, Any]) -> dict[str, Any]:
@@ -206,10 +330,102 @@ def _start_run(payload: dict[str, Any]) -> dict[str, Any]:
     env = dict(os.environ)
     env["PYTHONPATH"] = pkg_root + os.pathsep + env.get("PYTHONPATH", "")
     env["PYTHONIOENCODING"] = "utf-8"
-    proc = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT, cwd=pkg_root, env=env)
+    popen_opts: dict[str, Any] = {}
+    if os.name == "nt":
+        popen_opts["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        popen_opts["start_new_session"] = True
+    proc = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT, cwd=pkg_root, env=env, **popen_opts)
+    control.write_run_control(root / APP_DIR, proc.pid, root)
     with _LOCK:
         _RUNS[str(root)] = proc
+    threading.Thread(target=_watch_run, args=(root, proc, log_file), daemon=True).start()
     return {"ok": True, "dir": str(root), "pid": proc.pid}
+
+
+def _pause_run(payload: dict[str, Any]) -> dict[str, Any]:
+    raw_dir = str(payload.get("dir") or "").strip()
+    if not raw_dir:
+        return {"ok": False, "error": "dir required"}
+    root = Path(raw_dir).expanduser().resolve()
+    app_dir = root / APP_DIR
+    with _LOCK:
+        proc = _RUNS.pop(str(root), None)
+    killed = control.terminate_process_tree(proc, app_dir, root)
+    cp = control.load_checkpoint(app_dir)
+    if not cp:
+        return {"ok": False, "error": "no resumable checkpoint"}
+    target = Path(cp.get("working_dir")) if cp.get("run_type") == "repair" and cp.get("working_dir") else root / "current"
+    control.restore_active(app_dir, target)
+    cp["status"] = "paused"
+    cp["pause_reason"] = "Paused by user; in-flight agent output was discarded"
+    control.save_checkpoint(app_dir, cp)
+    state = load_json(app_dir / STATE_FILE, {})
+    if cp.get("run_type") == "repair":
+        job = repair.load_job(root, str(cp.get("job_id") or ""))
+        if job:
+            job["status"] = "paused"
+            job["error"] = cp["pause_reason"]
+            repair.save_job(root, job)
+    else:
+        state["status"] = "paused"
+        state["stop_reason"] = cp["pause_reason"]
+        save_json(app_dir / STATE_FILE, state)
+        control.write_progress_doc(root, cp, state)
+    prog = load_json(app_dir / PROGRESS_FILE, {})
+    prog.update({"status": "paused", "active": [], "run_ended_at": now_text()})
+    prog.setdefault("events", []).append({
+        "time": now_text(), "step": "PAUSE", "agent": cp.get("next_agent", ""),
+        "message": "in-flight output discarded; checkpoint preserved", "kind": "discarded",
+    })
+    save_json(app_dir / PROGRESS_FILE, prog, stamp=False)
+    return {"ok": True, "mode": "pause", "killed": killed, "checkpoint": cp}
+
+
+def _start_repair(payload: dict[str, Any], existing_job_id: str = "") -> dict[str, Any]:
+    raw_dir = str(payload.get("dir") or "").strip()
+    if not raw_dir:
+        return {"ok": False, "error": "dir required"}
+    root = Path(raw_dir).expanduser().resolve()
+    if _is_running(str(root)):
+        return {"ok": False, "error": "another project task is already active"}
+    try:
+        job = repair.load_job(root, existing_job_id) if existing_job_id else repair.create_job(
+            root, int(payload.get("version", 0) or 0), str(payload.get("request") or ""),
+            str(payload.get("test_command") or ""),
+        )
+    except (ValueError, OSError) as exc:
+        return {"ok": False, "error": str(exc)}
+    if not job:
+        return {"ok": False, "error": "repair job not found"}
+    cmd = [sys.executable, "-u", "-m", "autodevloop", "repair-run", "--project-dir", str(root), "--job-id", job["id"]]
+    log_file = (root / APP_DIR / "web_run.log").open("a", encoding="utf-8")
+    pkg_root = str(Path(__file__).resolve().parents[1])
+    env = dict(os.environ)
+    env["PYTHONPATH"] = pkg_root + os.pathsep + env.get("PYTHONPATH", "")
+    env["PYTHONIOENCODING"] = "utf-8"
+    opts: dict[str, Any] = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {"start_new_session": True}
+    proc = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT, cwd=pkg_root, env=env, **opts)
+    control.write_run_control(root / APP_DIR, proc.pid, root)
+    with _LOCK:
+        _RUNS[str(root)] = proc
+    threading.Thread(target=_watch_run, args=(root, proc, log_file), daemon=True).start()
+    return {"ok": True, "job": job, "pid": proc.pid}
+
+
+def _resume_run(payload: dict[str, Any]) -> dict[str, Any]:
+    root = Path(str(payload.get("dir") or "")).expanduser().resolve()
+    cp = control.load_checkpoint(root / APP_DIR)
+    if cp.get("run_type") == "repair":
+        return _start_repair(payload, str(cp.get("job_id") or ""))
+    return _start_run(payload)
+
+
+def _promote_repair(payload: dict[str, Any]) -> dict[str, Any]:
+    root = Path(str(payload.get("dir") or "")).expanduser().resolve()
+    if _is_running(str(root)) or control.load_checkpoint(root / APP_DIR).get("status") == "paused":
+        return {"ok": False, "error": "stop or finish the active task before promotion"}
+    return repair.promote_job(root, str(payload.get("job_id") or ""))
 
 
 def _rollback_current(root: Path) -> tuple[bool, int]:
@@ -238,15 +454,22 @@ def _stop_run(payload: dict[str, Any]) -> dict[str, Any]:
     app_dir.mkdir(parents=True, exist_ok=True)
 
     if mode == "immediate":
+        existing_cp = control.load_checkpoint(app_dir)
+        if existing_cp.get("run_type") == "repair":
+            return {"ok": False, "error": "discard-version stop applies only to the main development flow; pause the repair instead"}
         with _LOCK:
             proc = _RUNS.pop(str(root), None)
-        if proc is None or proc.poll() is not None:
-            # Not tracked (e.g. server restarted). Fall back to a graceful stop.
+        persisted_alive = control.persisted_process_alive(app_dir, root)
+        has_checkpoint = bool(control.load_checkpoint(app_dir))
+        if (proc is None or proc.poll() is not None) and not persisted_alive and not has_checkpoint:
+            # No validated process remains; leave a STOP marker for a runner
+            # that may be between startup and metadata persistence.
             write_text(app_dir / STOP_FILE, f"stop requested at {now_text()}\n")
             return {"ok": True, "mode": "graceful_fallback",
                     "note": "process not tracked; requested graceful stop instead"}
-        _kill(proc)
+        control.terminate_process_tree(proc, app_dir, root)
         rolled, rolled_to = _rollback_current(root)
+        control.clear_checkpoint(app_dir)
         # Patch state + progress so the UI reflects the abort.
         state = load_json(app_dir / STATE_FILE, {})
         if state:
@@ -298,13 +521,37 @@ def _save_config(dir_str: str, payload: dict[str, Any]) -> dict[str, Any]:
 
     config = payload.get("config")
     if isinstance(config, dict):
-        save_config(root, deep_merge(default_config(), config))
+        # Settings UI sends only editable fields; preserve the project goal,
+        # architecture hint, brainstorm flag, and any future unknown keys.
+        save_config(root, deep_merge(load_config(root), config))
     base = prompts.templates_dir(root / APP_DIR)
     base.mkdir(parents=True, exist_ok=True)
     for name, body in templates.items():
         if name in prompts.TEMPLATE_NAMES and isinstance(body, str):
             write_text(base / f"{name}.md", body.rstrip() + "\n")
     return {"ok": True}
+
+
+def _directives_payload(dir_str: str) -> dict[str, Any]:
+    root = Path(dir_str).expanduser().resolve()
+    state = load_json(root / APP_DIR / STATE_FILE, {})
+    return {"directives": control.load_directives(root / APP_DIR),
+            "version": int(state.get("current_version", 0) or 0) + 1}
+
+
+def _save_directive(payload: dict[str, Any]) -> dict[str, Any]:
+    root = Path(str(payload.get("dir") or "")).expanduser().resolve()
+    app_dir = root / APP_DIR
+    state = load_json(app_dir / STATE_FILE, {})
+    if payload.get("id"):
+        ok = control.set_directive_active(app_dir, str(payload["id"]), bool(payload.get("active")))
+        return {"ok": ok}
+    text = str(payload.get("text") or "").strip()
+    if not text:
+        return {"ok": False, "error": "directive text is required"}
+    cp = control.load_checkpoint(app_dir)
+    version = int(cp["version"]) if "version" in cp else int(state.get("current_version", 0) or 0) + 1
+    return {"ok": True, "directive": control.add_directive(app_dir, text, str(payload.get("scope") or "version"), version)}
 
 
 # --------------------------------------------------------------------------- #
@@ -332,6 +579,8 @@ class Handler(BaseHTTPRequestHandler):
             return _text_response(self, INDEX_HTML, "text/html; charset=utf-8")
         if path == "/api/projects":
             return _json_response(self, {"projects": [_project_summary(e) for e in registry.load()]})
+        if path == "/api/brainstorm/design":
+            return _json_response(self, _brainstorm_design(self._query().get("dir", "")))
         if path == "/api/state":
             root = Path(self._query().get("dir", ""))
             return _json_response(self, load_json(root / APP_DIR / STATE_FILE, {}))
@@ -343,6 +592,14 @@ class Handler(BaseHTTPRequestHandler):
             return _json_response(self, prog)
         if path == "/api/config":
             return _json_response(self, _get_config(self._query().get("dir", "")))
+        if path == "/api/checkpoint":
+            root = Path(self._query().get("dir", "")).resolve()
+            return _json_response(self, control.load_checkpoint(root / APP_DIR))
+        if path == "/api/directives":
+            return _json_response(self, _directives_payload(self._query().get("dir", "")))
+        if path == "/api/repairs":
+            root = Path(self._query().get("dir", "")).resolve()
+            return _json_response(self, {"jobs": repair.list_jobs(root)})
         if path == "/api/log":
             return self._serve_log()
         if path == "/api/doc":
@@ -354,14 +611,28 @@ class Handler(BaseHTTPRequestHandler):
         body = self._read_body()
         if path == "/api/create":
             return _json_response(self, _create_project(body))
+        if path == "/api/delete":
+            return _json_response(self, _delete_project(body))
         if path == "/api/brainstorm":
             return _json_response(self, _brainstorm_turn(body))
+        if path == "/api/brainstorm/design":
+            return _json_response(self, _save_brainstorm_design(body))
         if path == "/api/start":
             return _json_response(self, _start_run(body))
+        if path == "/api/resume":
+            return _json_response(self, _resume_run(body))
+        if path == "/api/pause":
+            return _json_response(self, _pause_run(body))
+        if path == "/api/repairs/start":
+            return _json_response(self, _start_repair(body))
+        if path == "/api/repairs/promote":
+            return _json_response(self, _promote_repair(body))
         if path == "/api/stop":
             return _json_response(self, _stop_run(body))
         if path == "/api/config":
             return _json_response(self, _save_config(self._query().get("dir", ""), body))
+        if path == "/api/directives":
+            return _json_response(self, _save_directive(body))
         return _text_response(self, "not found", status=404)
 
     def _serve_log(self) -> None:
@@ -378,6 +649,9 @@ class Handler(BaseHTTPRequestHandler):
         root = Path(q.get("dir", "")).resolve()
         which = q.get("name", "changelog")
         mapping = {"changelog": root / "CHANGELOG.md", "features": root / "FEATURES.md",
+                   "brainstorm-spec": root / "docs" / "brainstorm-spec.md",
+                   "brainstorm-history": root / "docs" / "brainstorm-history.md",
+                   "development-progress": root / "docs" / "development-progress.md",
                    "report": root / APP_DIR / "final_report.md", "weblog": root / APP_DIR / "web_run.log"}
         target = mapping.get(which)
         if target is None or not target.exists():
@@ -442,7 +716,10 @@ button:disabled{opacity:.45;cursor:not-allowed;filter:none}
 .proj{padding:10px 12px;border:1px solid var(--line);border-radius:10px;margin-bottom:9px;cursor:pointer;background:var(--panel)}
 .proj:hover{border-color:var(--line2)}
 .proj.active{border-color:var(--brand);background:var(--brand-soft)}
+.proj .head{display:flex;align-items:center;gap:8px}
 .proj .nm{font-weight:600}
+.proj .del{margin-left:auto;background:transparent;color:var(--muted);border:0;padding:2px 5px;border-radius:6px;font-size:14px;line-height:1}
+.proj .del:hover{background:var(--bad-soft);color:var(--bad)}
 .proj .meta{color:var(--muted);font-size:12px;margin-top:4px;display:flex;gap:6px;align-items:center;flex-wrap:wrap}
 .tabs{display:flex;gap:6px;margin-bottom:18px}
 .tabs .t{padding:8px 14px;border-radius:9px;cursor:pointer;color:var(--muted);font-weight:600}
@@ -543,6 +820,41 @@ label{display:block;margin:11px 0 5px;color:var(--muted);font-size:12px;font-wei
 .helpsec p{margin:4px 0;color:var(--text);font-size:13px;line-height:1.6}
 .helpsec table{margin-top:8px}
 .helpsec td,.helpsec th{font-size:12.5px}
+#bsModal .box{width:680px;padding:24px}
+.bs-log{max-height:48vh;overflow:auto;padding:14px 10px 14px 4px;display:flex;flex-direction:column;gap:18px;scroll-behavior:smooth}
+.bs-msg{display:flex;align-items:flex-start;gap:10px}
+.bs-msg.user{flex-direction:row-reverse}
+.bs-avatar{width:28px;height:28px;border-radius:9px;display:flex;align-items:center;justify-content:center;flex:0 0 28px;font-size:12px;font-weight:800;background:var(--brand-soft);color:var(--brand)}
+.bs-msg.user .bs-avatar{background:#e9edf4;color:#566174}
+.bs-content{max-width:82%;min-width:0}
+.bs-who{font-size:11px;font-weight:700;color:var(--muted);margin:0 2px 5px}
+.bs-msg.user .bs-who{text-align:right}
+.bs-bubble{padding:10px 13px;border-radius:5px 14px 14px 14px;background:var(--brand-soft);line-height:1.65;white-space:pre-wrap;overflow-wrap:anywhere}
+.bs-msg.user .bs-bubble{background:#eef1f6;border-radius:14px 5px 14px 14px}
+.bs-thinking .bs-bubble{display:flex;align-items:center;gap:10px;color:var(--muted);padding:9px 13px}
+.bs-spark{width:18px;height:18px;border-radius:50%;background:conic-gradient(from 20deg,var(--brand),#9bb7ff,#c9a8ff,var(--brand));position:relative;animation:bs-spin 1.8s linear infinite}
+.bs-spark:after{content:"";position:absolute;inset:4px;border-radius:50%;background:var(--brand-soft)}
+.bs-dots{display:inline-flex;gap:4px;align-items:center}
+.bs-dots i{width:5px;height:5px;border-radius:50%;background:var(--brand);animation:bs-dot 1.2s ease-in-out infinite}
+.bs-dots i:nth-child(2){animation-delay:.16s}.bs-dots i:nth-child(3){animation-delay:.32s}
+@keyframes bs-spin{to{transform:rotate(360deg)}}
+@keyframes bs-dot{0%,70%,100%{opacity:.25;transform:translateY(0)}35%{opacity:1;transform:translateY(-3px)}}
+.bs-choices{display:flex;flex-wrap:wrap;gap:8px;margin:-8px 0 0 38px}
+.bs-choices button{background:var(--panel);color:var(--text);border:1px solid var(--line2);text-align:left;font-weight:600;box-shadow:0 1px 2px rgba(20,30,60,.04)}
+.bs-choices button:hover{border-color:var(--brand);background:var(--brand-soft);color:var(--brand)}
+.bs-composer{border-top:1px solid var(--line);padding-top:14px}
+.bs-composer textarea{min-height:72px;resize:vertical}
+.bs-final{margin-top:12px;padding:16px;border:1px solid #bfd0fa;border-radius:14px;background:linear-gradient(145deg,#f8faff,#eef4ff)}
+.bs-final h4{margin:0 0 5px;font-size:14px}
+.bs-final textarea{min-height:260px;margin-top:12px;background:#fff;line-height:1.55}
+.bs-final-actions,.design-actions{display:flex;align-items:center;justify-content:flex-end;gap:8px;margin-top:10px}
+.design-panel{border-color:#b9ccf8;background:linear-gradient(145deg,#fff,#f4f7ff)}
+.design-head{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;margin-bottom:10px}
+.design-head h3{margin:0 0 4px}
+.design-panel textarea{min-height:280px;line-height:1.6;background:#fff}
+.design-readonly{max-height:360px;line-height:1.6;background:#fff;border:1px solid var(--line)}
+.save-state{font-size:12px;color:var(--ok);margin-right:auto}
+@media (prefers-reduced-motion:reduce){.bs-spark,.bs-dots i{animation:none}}
 </style>
 </head>
 <body>
@@ -600,9 +912,10 @@ label{display:block;margin:11px 0 5px;color:var(--muted);font-size:12px;font-wei
   <div class="box">
     <h3 id="bsTitle"></h3>
     <div class="muted" id="bsDesc" style="font-size:12px;margin-bottom:8px"></div>
-    <div id="bsLog" style="max-height:50vh;overflow:auto;display:flex;flex-direction:column;gap:8px;margin-bottom:10px"></div>
-    <div id="bsInputWrap" style="display:none">
-      <textarea id="bsReply" style="min-height:60px"></textarea>
+    <div id="bsLog" class="bs-log"></div>
+    <div id="bsFinal"></div>
+    <div id="bsInputWrap" class="bs-composer" style="display:none">
+      <textarea id="bsReply"></textarea>
       <div style="margin-top:10px;display:flex;gap:8px;justify-content:flex-end">
         <button class="sec" onclick="bsFinish()" id="bsDone"></button>
         <button onclick="bsSend()" id="bsSendBtn"></button>
@@ -626,9 +939,13 @@ label{display:block;margin:11px 0 5px;color:var(--muted);font-size:12px;font-wei
 <script>
 const I18N = {
   en:{brandSub:"autonomous AI iteration · local dashboard",projects:"Projects",noProjects:"No projects yet.",
-    selectHint:"Select a project, or create a new one.",newBtn:"+ New project",helpLbl:"Help",close:"Close",
-    tabDash:"Dashboard",tabVer:"Versions",tabDocs:"Docs",tabSet:"Settings",
-    run:"▶ Run",stopG:"Stop (graceful)",stopI:"Stop (discard)",
+    selectHint:"Select a project, or create a new one.",newBtn:"+ New project",helpLbl:"Help",close:"Close",deleteProject:"Delete project",
+    confirmDelete:"Permanently delete this project and every file in its directory? This cannot be undone.\n\n{path}",deleteRunning:"Stop the active run before deleting this project.",
+    tabDash:"Dashboard",tabVer:"Versions",tabDocs:"Docs",tabRepair:"Bug repair",tabSet:"Settings",
+    run:"▶ Run",pause:"⏸ Pause agent",resume:"▶ Continue",stopG:"Stop (graceful)",stopI:"Stop (discard version)",
+    checkpoint:"Resume checkpoint",nextAgent:"Next agent",lastAgent:"Last completed",humanInput:"Human override",addDirective:"Add directive",
+    scopeNext:"Next agent only",scopeVersion:"Rest of this version",scopeFuture:"All future versions",
+    repairTitle:"Independent bug repair",repairRequest:"Bug or optimization request",repairStart:"Start repair",repairPromote:"Promote to current",repairTest:"Test command (optional)",
     status:"Status",version:"Version",phase:"Phase",goalProg:"Goal progress",calls:"Agent calls",tokens:"Tokens",runtime:"Run time",
     activeAgents:"Running now",noActive:"No agent running.",liveProgress:"Activity log",noEvents:"No activity yet.",
     outputViewer:"Agent output",outputHint:"Click an output button in the log to view an agent's full output here.",
@@ -650,6 +967,10 @@ const I18N = {
     bsTitle:"Brainstorm the design",bsDesc:"The AI asks one question at a time. Answer them to refine the goal before the run.",
     bsAI:"AI",bsYou:"You",bsThinking:"thinking…",bsAgreed:"Design agreed — saved to docs/brainstorm-spec.md.",
     bsSend:"Send",bsDone:"Finish now",bsPlaceholder:"Type your answer…",bsFinishMsg:"Finish now with what we have.",
+    bsFinalTitle:"Final design",bsFinalHint:"Review and edit this build brief. The agents will use this exact document when you run the project.",
+    designTitle:"Brainstorm design",designEditHint:"Editable until the first run. Save it when you are happy; this document becomes the agents' build brief.",
+    designLockedHint:"The project has started, so this agreed design is now read-only.",designSave:"Save design",designSaveRun:"Save & run",designSaved:"Saved ✓",
+    brainstormHistoryTitle:"Brainstorm conversation (read-only)",brainstormSpecTitle:"Final brainstorm design",
     mTip:"The provider CLI must already be installed and authenticated locally. No API key is entered here.",
     cancel:"Cancel",create:"Create",on:"on",off:"off",confirmImmediate:"Discard the current unfinished version and roll back to the last completed version?",
     st_running:"running",st_completed:"completed",st_failed:"failed",st_stopped:"stopped",st_initialized:"not started",st_unknown:"unknown",
@@ -699,9 +1020,13 @@ const I18N = {
     phHelpLink:"Not sure what a placeholder means? See the Help guide →"},
 
   zh:{brandSub:"自治 AI 迭代 · 本地面板",projects:"项目",noProjects:"还没有项目。",
-    selectHint:"选择一个项目，或新建一个。",newBtn:"+ 新建项目",helpLbl:"帮助",close:"关闭",
-    tabDash:"总览",tabVer:"版本",tabDocs:"文档",tabSet:"设置",
-    run:"▶ 运行",stopG:"停止（优雅）",stopI:"停止（废弃本版）",
+    selectHint:"选择一个项目，或新建一个。",newBtn:"+ 新建项目",helpLbl:"帮助",close:"关闭",deleteProject:"删除项目",
+    confirmDelete:"确定永久删除这个项目及其目录中的全部文件吗？此操作无法撤销。\n\n{path}",deleteRunning:"请先停止正在运行的任务，再删除项目。",
+    tabDash:"总览",tabVer:"版本",tabDocs:"文档",tabRepair:"Bug 修复",tabSet:"设置",
+    run:"▶ 运行",pause:"⏸ 暂停当前 Agent",resume:"▶ 继续",stopG:"停止（优雅）",stopI:"停止（废弃本版）",
+    checkpoint:"恢复检查点",nextAgent:"下一个 Agent",lastAgent:"最后完成",humanInput:"人工补充（最高优先级）",addDirective:"添加补充",
+    scopeNext:"仅下一个 Agent",scopeVersion:"当前版本剩余流程",scopeFuture:"后续所有版本",
+    repairTitle:"独立 Bug 修复",repairRequest:"Bug 或优化要求",repairStart:"开始修复",repairPromote:"提升为 current",repairTest:"测试命令（可选）",
     status:"状态",version:"版本",phase:"阶段",goalProg:"目标进度",calls:"Agent 调用",tokens:"Tokens",runtime:"运行时长",
     activeAgents:"正在运行",noActive:"当前没有 agent 在运行。",liveProgress:"活动日志",noEvents:"暂无活动。",
     outputViewer:"Agent 输出",outputHint:"点击日志中的「输出」按钮，可在此查看该 agent 的完整输出。",
@@ -723,6 +1048,10 @@ const I18N = {
     bsTitle:"头脑风暴梳理设计",bsDesc:"AI 每次只问一个问题。逐一回答，在开跑前把目标打磨清楚。",
     bsAI:"AI",bsYou:"你",bsThinking:"思考中…",bsAgreed:"设计已确认——已保存到 docs/brainstorm-spec.md。",
     bsSend:"发送",bsDone:"现在结束",bsPlaceholder:"输入你的回答…",bsFinishMsg:"用现有信息直接结束。",
+    bsFinalTitle:"最终方案",bsFinalHint:"请检查并修改这份开发方案。运行项目后，所有 Agent 都会以这份文档作为开发目标。",
+    designTitle:"头脑风暴最终方案",designEditHint:"首次运行前可以编辑。满意后保存，运行时 Agent 将直接使用这份文档。",
+    designLockedHint:"项目已经运行，最终方案现已锁定为只读。",designSave:"保存方案",designSaveRun:"保存并运行",designSaved:"已保存 ✓",
+    brainstormHistoryTitle:"头脑风暴会话履历（只读）",brainstormSpecTitle:"头脑风暴最终方案",
     mTip:"所选 provider 的 CLI 必须已在本地安装并登录。此处不需要填写任何 API key。",
     cancel:"取消",create:"创建",on:"开",off:"关",confirmImmediate:"废弃当前未完成的版本，并回退到上一个已完成的版本？",
     st_running:"运行中",st_completed:"已完成",st_failed:"失败",st_stopped:"已停止",st_initialized:"未开始",st_unknown:"未知",
@@ -772,7 +1101,8 @@ const I18N = {
     phHelpLink:"不清楚占位符含义？查看帮助文档 →"},
 
   ja:{brandSub:"自律型 AI 反復 · ローカルダッシュボード",projects:"プロジェクト",noProjects:"プロジェクトがありません。",
-    selectHint:"プロジェクトを選ぶか、新規作成してください。",newBtn:"+ 新規作成",helpLbl:"ヘルプ",close:"閉じる",
+    selectHint:"プロジェクトを選ぶか、新規作成してください。",newBtn:"+ 新規作成",helpLbl:"ヘルプ",close:"閉じる",deleteProject:"プロジェクトを削除",
+    confirmDelete:"このプロジェクトとディレクトリ内の全ファイルを完全に削除しますか？元に戻せません。\n\n{path}",deleteRunning:"実行中の処理を停止してからプロジェクトを削除してください。",
     tabDash:"ダッシュボード",tabVer:"バージョン",tabDocs:"ドキュメント",tabSet:"設定",
     run:"▶ 実行",stopG:"停止（安全）",stopI:"停止（破棄）",
     status:"状態",version:"バージョン",phase:"フェーズ",goalProg:"目標達成度",calls:"エージェント呼出",tokens:"トークン",runtime:"実行時間",
@@ -796,6 +1126,10 @@ const I18N = {
     bsTitle:"設計のブレインストーミング",bsDesc:"AI は1問ずつ質問します。回答して、実行前に目標を磨き込みます。",
     bsAI:"AI",bsYou:"あなた",bsThinking:"考え中…",bsAgreed:"設計が決まりました — docs/brainstorm-spec.md に保存しました。",
     bsSend:"送信",bsDone:"ここで終了",bsPlaceholder:"回答を入力…",bsFinishMsg:"今ある情報で終了してください。",
+    bsFinalTitle:"最終設計",bsFinalHint:"この開発仕様を確認・編集してください。実行後、エージェントはこの文書を開発目標として使用します。",
+    designTitle:"ブレインストーム最終設計",designEditHint:"初回実行までは編集できます。保存後、この文書がエージェントの開発仕様になります。",
+    designLockedHint:"プロジェクトは実行済みのため、最終設計は読み取り専用です。",designSave:"設計を保存",designSaveRun:"保存して実行",designSaved:"保存済み ✓",
+    brainstormHistoryTitle:"ブレインストーム会話履歴（読み取り専用）",brainstormSpecTitle:"ブレインストーム最終設計",
     mTip:"選択したプロバイダの CLI は事前にインストール・認証済みである必要があります。API キーの入力は不要です。",
     cancel:"キャンセル",create:"作成",on:"オン",off:"オフ",confirmImmediate:"未完成の現在のバージョンを破棄し、最後に完了したバージョンに戻しますか？",
     st_running:"実行中",st_completed:"完了",st_failed:"失敗",st_stopped:"停止",st_initialized:"未開始",st_unknown:"不明",
@@ -855,6 +1189,7 @@ const SIMPLE_STEPS={arch:true,goal_check:false,test_agent:false,doc:false,scout:
 const ADVANCED_STEPS={arch:true,goal_check:true,test_agent:true,doc:true,scout:true,evaluate:true,features_doc:true};
 // Which optional step gates each prompt template (null = always used / required).
 const TMPL_STEP={arch:"arch",plan:null,dev:null,doc:"doc",test:"test_agent",review:null,fix:null,scout:"scout",evaluate:"evaluate",goal_check:"goal_check"};
+const PROVIDER_AGENTS=["brainstorm","arch","plan","dev","doc","test","review","fix","goal_check","scout","evaluate","bugfix","bugverify"];
 // Per-placeholder docs for the Help guide: where used + meaning + a suggested
 // lead-in phrase, in each language. [desc, example phrasing].
 const PH={
@@ -984,36 +1319,61 @@ function bsOpen(dir){
   document.getElementById('bsSendBtn').textContent=t('bsSend');
   document.getElementById('bsReply').placeholder=t('bsPlaceholder');
   document.getElementById('bsLog').innerHTML='';
+  document.getElementById('bsFinal').innerHTML='';
   document.getElementById('bsInputWrap').style.display='none';
   bsTurn('');
 }
-function bsClose(){document.getElementById('bsModal').classList.remove('show');tab='settings';dashBuilt=false;render();}
+function bsClose(){document.getElementById('bsModal').classList.remove('show');tab='dashboard';dashBuilt=false;render();}
 function bsAppend(role,text){
   const log=document.getElementById('bsLog');
-  const who=role==='ai'?t('bsAI'):(role==='you'?t('bsYou'):'');
-  const bg=role==='ai'?'var(--brand-soft)':(role==='you'?'var(--panel2)':'transparent');
-  const body=(who?'<b>'+who+':</b> ':'')+h(text).replace(/\n/g,'<br>');
-  log.insertAdjacentHTML('beforeend','<div style="background:'+bg+';padding:8px 10px;border-radius:9px">'+body+'</div>');
+  const user=role==='you',who=user?t('bsYou'):t('bsAI'),avatar=user?h(who).slice(0,1):'✦';
+  log.insertAdjacentHTML('beforeend','<div class="bs-msg '+(user?'user':'ai')+'">'
+    +'<div class="bs-avatar">'+avatar+'</div><div class="bs-content"><div class="bs-who">'+h(who)+'</div>'
+    +'<div class="bs-bubble">'+h(text)+'</div></div></div>');
   log.scrollTop=log.scrollHeight;
+}
+function bsShowThinking(){
+  const log=document.getElementById('bsLog');
+  log.insertAdjacentHTML('beforeend','<div class="bs-msg ai bs-thinking" id="bsThinking"><div class="bs-avatar">✦</div>'
+    +'<div class="bs-content"><div class="bs-who">'+h(t('bsAI'))+'</div><div class="bs-bubble"><span class="bs-spark"></span>'
+    +'<span>'+h(t('bsThinking'))+'</span><span class="bs-dots"><i></i><i></i><i></i></span></div></div></div>');
+  log.scrollTop=log.scrollHeight;
+}
+function bsClearChoices(){const el=document.getElementById('bsChoices');if(el)el.remove();}
+function bsShowFinal(spec){
+  document.getElementById('bsInputWrap').style.display='none';bsClearChoices();
+  document.getElementById('bsFinal').innerHTML='<div class="bs-final"><h4>'+h(t('bsFinalTitle'))+'</h4>'
+    +'<div class="hint">'+h(t('bsFinalHint'))+'</div><textarea id="bsFinalEditor">'+h(spec||'')+'</textarea>'
+    +'<div class="bs-final-actions"><span class="save-state" id="bsFinalState"></span>'
+    +'<button class="sec" onclick="bsClose()">'+h(t('close'))+'</button>'
+    +'<button onclick="bsSaveFinal(false)">'+h(t('designSave'))+'</button>'
+    +'<button class="ok" onclick="bsSaveFinal(true)">▶ '+h(t('designSaveRun'))+'</button></div></div>';
+}
+async function bsSaveFinal(runAfter){
+  const ed=document.getElementById('bsFinalEditor');if(!ed)return false;
+  const res=await api('/api/brainstorm/design',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dir:bsDir,spec:ed.value})});
+  if(!res.ok){alert(res.error||'failed');return false;}
+  const st=document.getElementById('bsFinalState');if(st)st.textContent=t('designSaved');
+  if(runAfter){document.getElementById('bsModal').classList.remove('show');current=bsDir;await doRun(true);}
+  return true;
 }
 async function bsTurn(reply){
   document.getElementById('bsInputWrap').style.display='none';
-  bsAppend('sys','<span class="muted">'+t('bsThinking')+'</span>');
-  const res=await api('/api/brainstorm',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dir:bsDir,reply})});
-  const log=document.getElementById('bsLog');if(log.lastChild)log.removeChild(log.lastChild);
+  bsShowThinking();
+  let res;
+  try{res=await api('/api/brainstorm',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dir:bsDir,reply})});}
+  catch(err){res={ok:false,error:String(err)};}
+  const thinking=document.getElementById('bsThinking');if(thinking)thinking.remove();
   if(!res.ok){bsAppend('ai','⚠ '+(res.error||'failed'));return;}
   if(res.done){
     bsAppend('ai',t('bsAgreed'));
-    if(res.spec)bsAppend('ai',res.spec);
-    log.insertAdjacentHTML('beforeend','<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:6px">'
-      +'<button class="sec" onclick="bsClose()">'+t('close')+'</button>'
-      +'<button class="ok" onclick="bsClose();doRun()">'+t('run')+'</button></div>');
-    log.scrollTop=log.scrollHeight;loadProjects();return;
+    bsShowFinal(res.spec||res.refined_goal||'');loadProjects();return;
   }
   bsAppend('ai',res.question||'');
   if(res.choices&&res.choices.length){
-    log.insertAdjacentHTML('beforeend','<div style="display:flex;flex-wrap:wrap;gap:6px">'
-      +res.choices.map(c=>'<button class="sec" onclick="bsPick(this)">'+h(c)+'</button>').join('')+'</div>');
+    const log=document.getElementById('bsLog');
+    log.insertAdjacentHTML('beforeend','<div class="bs-choices" id="bsChoices">'
+      +res.choices.map(c=>'<button onclick="bsPick(this)">'+h(c)+'</button>').join('')+'</div>');
     log.scrollTop=log.scrollHeight;
   }
   document.getElementById('bsReply').value='';
@@ -1024,9 +1384,10 @@ function bsPick(btn){document.getElementById('bsReply').value=btn.textContent;bs
 function bsSend(){
   const r=document.getElementById('bsReply').value.trim();
   if(!r)return;
+  bsClearChoices();
   bsAppend('you',r);bsTurn(r);
 }
-function bsFinish(){bsAppend('you',t('bsFinishMsg'));bsTurn('Please finalise the design now with what we have.');}
+function bsFinish(){const msg=t('bsFinishMsg');bsClearChoices();bsAppend('you',msg);bsTurn(msg);}
 
 async function loadProjects(){
   const d=await api('/api/projects');projects=d.projects||[];
@@ -1035,10 +1396,21 @@ async function loadProjects(){
   box.innerHTML=projects.map((p,i)=>{
     const cls=p.running?'run':(p.status&&p.status.startsWith('completed')?'ok':(p.status==='failed'?'bad':(p.status==='stopped'?'warn':'')));
     return '<div class="proj '+(p.dir===current?'active':'')+'" onclick="selectIdx('+i+')">'
-      +'<div class="nm">'+h(p.name)+'</div><div class="meta">'
+      +'<div class="head"><div class="nm">'+h(p.name)+'</div><button class="del" title="'+h(t('deleteProject'))+'" aria-label="'+h(t('deleteProject'))+'" onclick="deleteProject(event,'+i+')">🗑</button></div><div class="meta">'
       +'<span class="pill '+cls+'">'+(p.running?'<span class="dot"></span>':'')+statusLabel(p.status)+'</span>'
       +'<span>v'+p.current_version+'/'+p.max_versions+'</span><span>'+(p.goal_progress||0)+'%</span></div></div>';
   }).join('');
+}
+async function deleteProject(event,i){
+  event.stopPropagation();
+  const p=projects[i];if(!p)return;
+  if(p.running){alert(t('deleteRunning'));return;}
+  if(!confirm(t('confirmDelete').replace('{path}',p.dir)))return;
+  const res=await api('/api/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dir:p.dir,confirm_dir:p.dir})});
+  if(!res.ok){alert(res.error||'failed');return;}
+  if(current===p.dir){current=null;tab='dashboard';dashBuilt=false;curEvents=[];renderedCount=0;selectedLog=null;}
+  await loadProjects();
+  render();
 }
 function selectIdx(i){selectDir(projects[i].dir);}
 function selectDir(dir){current=dir;tab='dashboard';dashBuilt=false;curEvents=[];renderedCount=0;selectedLog=null;loadProjects();render();}
@@ -1049,20 +1421,24 @@ async function render(){
   const main=document.getElementById('main');
   if(!current){main.innerHTML='<div class="muted">'+t('selectHint')+'</div>';return;}
   const tabs='<div class="tabs">'
-    +['dashboard','versions','docs','settings'].map(x=>'<div class="t '+(tab===x?'active':'')+'" onclick="setTab(\''+x+'\')">'+t(x==='dashboard'?'tabDash':x==='versions'?'tabVer':x==='docs'?'tabDocs':'tabSet')+'</div>').join('')
+    +['dashboard','versions','docs','repair','settings'].map(x=>'<div class="t '+(tab===x?'active':'')+'" onclick="setTab(\''+x+'\')">'+t(x==='dashboard'?'tabDash':x==='versions'?'tabVer':x==='docs'?'tabDocs':x==='repair'?'tabRepair':'tabSet')+'</div>').join('')
     +'</div>';
-  if(tab==='dashboard'){ if(!dashBuilt){ main.innerHTML=tabs+dashSkeleton(); dashBuilt=true; curEvents=[];renderedCount=0; } await pollDashboard(true); }
+  if(tab==='dashboard'){ if(!dashBuilt){ main.innerHTML=tabs+dashSkeleton(); dashBuilt=true; curEvents=[];renderedCount=0; } await renderBrainstormDesign(); await pollDashboard(true); }
   else if(tab==='versions'){ main.innerHTML=tabs+await renderVersions(); }
   else if(tab==='docs'){ main.innerHTML=tabs+await renderDocs(); }
+  else if(tab==='repair'){ main.innerHTML=tabs+await renderRepairs(); }
   else if(tab==='settings'){ main.innerHTML=tabs+await renderSettings(); bindTemplate(); }
 }
 
 function dashSkeleton(){
   return '<div class="toolbar">'
     +'<button class="ok" id="btnRun" data-tip="'+h(t('tip_run'))+'" onclick="doRun()">'+t('run')+'</button>'
+    +'<button class="ok" id="btnResume" onclick="doResume()">'+t('resume')+'</button>'
+    +'<button class="sec" id="btnPause" onclick="doPause()">'+t('pause')+'</button>'
     +'<button class="warn" id="btnStopG" data-tip="'+h(t('tip_stopG'))+'" onclick="doStop(\'graceful\')">'+t('stopG')+'</button>'
     +'<button class="danger" id="btnStopI" data-tip="'+h(t('tip_stopI'))+'" onclick="doStop(\'immediate\')">'+t('stopI')+'</button>'
     +'<span class="rt">'+t('runtime')+': <b id="rtVal">-</b></span></div>'
+    +'<div id="brainstormDesign"></div><div id="checkpointBox"></div>'
     +'<div class="cards" id="cards"></div>'
     +'<div class="panel"><h3>'+t('activeAgents')+'</h3><div class="agents" id="agents"></div></div>'
     +'<div class="panel"><h3>'+t('liveProgress')+'</h3><div class="events" id="events"></div></div>'
@@ -1070,12 +1446,34 @@ function dashSkeleton(){
     +'<pre id="logview" class="muted">'+t('outputHint')+'</pre></div>';
 }
 
+async function renderBrainstormDesign(){
+  const box=document.getElementById('brainstormDesign');if(!box||!current)return;
+  const d=await api('/api/brainstorm/design?dir='+encodeURIComponent(current));
+  if(!d.exists){box.innerHTML='';return;}
+  const hint=d.editable?t('designEditHint'):t('designLockedHint');
+  const body=d.editable
+    ?'<textarea id="designEditor">'+h(d.spec)+'</textarea><div class="design-actions"><span class="save-state" id="designSaveState"></span>'
+      +'<button onclick="saveBrainstormDesign(false)">'+h(t('designSave'))+'</button><button class="ok" onclick="saveBrainstormDesign(true)">▶ '+h(t('designSaveRun'))+'</button></div>'
+    :'<pre class="design-readonly">'+h(d.spec)+'</pre>';
+  box.innerHTML='<div class="panel design-panel"><div class="design-head"><div><h3>✦ '+h(t('designTitle'))+'</h3><div class="hint">'+h(hint)+'</div></div>'
+    +(d.editable?'<span class="badge warn">✎</span>':'<span class="badge">🔒</span>')+'</div>'+body+'</div>';
+}
+async function saveBrainstormDesign(runAfter){
+  const ed=document.getElementById('designEditor');if(!ed)return true;
+  const res=await api('/api/brainstorm/design',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dir:current,spec:ed.value})});
+  if(!res.ok){alert(res.error||'failed');return false;}
+  const st=document.getElementById('designSaveState');if(st)st.textContent=t('designSaved');
+  if(runAfter)await doRun(true);
+  return true;
+}
+
 async function pollDashboard(force){
   if(tab!=='dashboard'||!current) return;
   const p=await api('/api/progress?dir='+encodeURIComponent(current));
   lastProgress=p; const running=!!p.running;
-  const br=document.getElementById('btnRun'),bg=document.getElementById('btnStopG'),bi=document.getElementById('btnStopI');
-  if(br){br.disabled=running;bg.disabled=!running;bi.disabled=!running;}
+  const br=document.getElementById('btnRun'),bc=document.getElementById('btnResume'),bp=document.getElementById('btnPause'),bg=document.getElementById('btnStopG'),bi=document.getElementById('btnStopI');
+  const paused=(p.status==='paused');
+  if(br){br.disabled=running||paused;bc.disabled=running||!paused;bp.disabled=!running;bg.disabled=!running;bi.disabled=!(running||paused);}
   const cls=running?'run':((p.status||'').startsWith('completed')?'ok':(p.status==='failed'?'bad':(p.status==='stopped'?'warn':'')));
   const gp=p.goal_progress||0,tk=p.tokens||{};
   const cards=document.getElementById('cards');
@@ -1105,7 +1503,27 @@ async function pollDashboard(force){
     if(!evs.length) ebox.innerHTML='<div class="muted">'+t('noEvents')+'</div>';
   }
   tickTimers();
+  await renderCheckpoint(paused);
 }
+async function renderCheckpoint(paused){
+  const box=document.getElementById('checkpointBox');if(!box)return;
+  if(document.activeElement&&['directiveText','directiveScope'].includes(document.activeElement.id))return;
+  const cp=await api('/api/checkpoint?dir='+encodeURIComponent(current));
+  if(!cp||!cp.run_type){box.innerHTML='';return;}
+  if(cp.run_type==='repair'){const bg=document.getElementById('btnStopG'),bi=document.getElementById('btnStopI');if(bg)bg.disabled=true;if(bi)bi.disabled=true;}
+  let extra='';
+  if(paused){
+    const d=await api('/api/directives?dir='+encodeURIComponent(current));
+    const rows=(d.directives||[]).filter(x=>x.active).map(x=>'<div class="ev"><span class="badge">'+h(x.scope)+'</span><span class="msg">'+h(x.text)+'</span><button class="tiny" onclick="toggleDirective(\''+h(x.id)+'\',false)">×</button></div>').join('');
+    extra='<div style="margin-top:12px"><label>'+h(t('humanInput'))+'</label><textarea id="directiveText" style="min-height:76px"></textarea>'
+      +'<div class="design-actions"><select id="directiveScope"><option value="version">'+h(t('scopeVersion'))+'</option><option value="next">'+h(t('scopeNext'))+'</option><option value="future">'+h(t('scopeFuture'))+'</option></select>'
+      +'<button onclick="addDirective()">'+h(t('addDirective'))+'</button></div>'+rows+'</div>';
+  }
+  box.innerHTML='<div class="panel"><h3>⏸ '+h(t('checkpoint'))+'</h3><div class="row"><div><span class="muted">v'+h(cp.version)+' · '+h(cp.phase||'')+'</span></div>'
+    +'<div><b>'+h(t('lastAgent'))+':</b> '+h(cp.last_completed_agent||'-')+'</div><div><b>'+h(t('nextAgent'))+':</b> '+h(cp.next_agent||'-')+'</div></div>'+extra+'</div>';
+}
+async function addDirective(){const text=val('directiveText');if(!text)return;await api('/api/directives',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dir:current,text:text,scope:document.getElementById('directiveScope').value})});await renderCheckpoint(true);}
+async function toggleDirective(id,active){await api('/api/directives',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dir:current,id:id,active:active})});await renderCheckpoint(true);}
 function card(l,v,s){return '<div class="card"><div class="lbl">'+l+'</div><div class="val">'+v+'</div><div class="sub">'+(s||'')+'</div></div>';}
 function evHtml(e,i){
   if(e.step==='VERSION_START'){
@@ -1132,7 +1550,14 @@ function tickTimers(){
     if(st){const end=(lastProgress.running||!en)?now:en;rt.textContent=fmtDur(end-st);}else rt.textContent='-';}
 }
 
-async function doRun(){const r=await api('/api/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dir:current})});if(!r.ok)alert(r.error||'failed');setTimeout(()=>pollDashboard(true),600);}
+async function doRun(skipDesignSave){
+  if(!skipDesignSave&&document.getElementById('designEditor')){const saved=await saveBrainstormDesign(false);if(!saved)return;}
+  const r=await api('/api/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dir:current})});
+  if(!r.ok){alert(r.error||'failed');return;}
+  await renderBrainstormDesign();setTimeout(()=>pollDashboard(true),600);
+}
+async function doPause(){const r=await api('/api/pause',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dir:current})});if(!r.ok)alert(r.error||'failed');setTimeout(()=>pollDashboard(true),300);}
+async function doResume(){const r=await api('/api/resume',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dir:current})});if(!r.ok)alert(r.error||'failed');setTimeout(()=>pollDashboard(true),500);}
 async function doStop(mode){
   if(mode==='immediate'&&!confirm(t('confirmImmediate')))return;
   const r=await api('/api/stop',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dir:current,mode:mode})});
@@ -1164,10 +1589,32 @@ function scoreBadge(n){n=parseInt(n)||0;const c=n>=80?'ok':(n>=60?'warn':'bad');
 function scoreBadge100(n){n=parseInt(n)||0;const c=n>=80?'ok':(n>=60?'warn':'');return '<span class="badge '+c+'">'+n+'</span>';}
 
 async function renderDocs(){
+  const d=await api('/api/brainstorm/design?dir='+encodeURIComponent(current));
   const ft=await api('/api/doc?dir='+encodeURIComponent(current)+'&name=features');
   const cl=await api('/api/doc?dir='+encodeURIComponent(current)+'&name=changelog');
-  return '<div class="panel"><h3>'+t('featuresTitle')+'</h3><pre>'+h(ft)+'</pre></div><div class="panel"><h3>'+t('changelogTitle')+'</h3><pre>'+h(cl)+'</pre></div>';
+  const dp=await api('/api/doc?dir='+encodeURIComponent(current)+'&name=development-progress');
+  let html='';
+  if(d.exists)html+='<div class="panel"><h3>✦ '+h(t('brainstormSpecTitle'))+'</h3><pre>'+h(d.spec)+'</pre></div>';
+  if(d.history)html+='<div class="panel"><h3>'+h(t('brainstormHistoryTitle'))+'</h3><pre>'+h(d.history)+'</pre></div>';
+  if(dp&&dp.indexOf('(not available')!==0)html+='<div class="panel"><h3>'+h(t('checkpoint'))+'</h3><pre>'+h(dp)+'</pre></div>';
+  return html+'<div class="panel"><h3>'+t('featuresTitle')+'</h3><pre>'+h(ft)+'</pre></div><div class="panel"><h3>'+t('changelogTitle')+'</h3><pre>'+h(cl)+'</pre></div>';
 }
+
+async function renderRepairs(){
+  const s=await api('/api/state?dir='+encodeURIComponent(current));
+  const data=await api('/api/repairs?dir='+encodeURIComponent(current));
+  const opts=(s.versions||[]).map(v=>'<option value="'+v.version+'">v'+v.version+' · '+h(v.feature_summary||'')+'</option>').join('');
+  const jobs=(data.jobs||[]).map(j=>{
+    const ev=(j.events||[]).slice(-12).map(e=>'<div class="ev"><span class="tm">'+h((e.time||'').slice(11))+'</span><span class="stp">'+h(e.step)+'</span><span class="msg">'+h(e.message)+'</span>'+(e.log?'<button class="logbtn" onclick="viewRepairLog(\''+h(e.log)+'\')">📄</button>':'')+'</div>').join('');
+    const promote=j.accepted?'<button class="ok" onclick="promoteRepair(\''+h(j.id)+'\')">'+h(t('repairPromote'))+'</button>':'';
+    return '<div class="panel"><div class="viewer-head"><h3>'+h(j.id)+' · '+h(j.status)+'</h3><span class="badge '+(j.accepted?'ok':'')+'">'+(j.accepted?'PASS':'attempt '+h(j.attempt||0))+'</span></div><p>'+h(j.request)+'</p><p class="muted">'+h(j.result_dir)+'</p>'+ev+'<div class="design-actions">'+promote+'</div></div>';
+  }).join('');
+  return '<div class="toolbar"><button class="sec" onclick="doPause()">'+h(t('pause'))+'</button><button class="ok" onclick="doResume()">'+h(t('resume'))+'</button><button class="sec" onclick="render()">↻</button></div>'
+    +'<div class="panel"><h3>🛠 '+h(t('repairTitle'))+'</h3><div class="row"><div><label>'+h(t('version'))+'</label><select id="repairVersion">'+opts+'</select></div><div><label>'+h(t('repairTest'))+'</label><input id="repairTest"></div></div><label>'+h(t('repairRequest'))+'</label><textarea id="repairRequest"></textarea><div class="design-actions"><button onclick="startRepair()">'+h(t('repairStart'))+'</button></div></div><div id="repairLog"></div>'+jobs;
+}
+async function startRepair(){const r=await api('/api/repairs/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dir:current,version:parseInt(val('repairVersion')||'0'),request:val('repairRequest'),test_command:val('repairTest')})});if(!r.ok)alert(r.error||'failed');else setTimeout(()=>render(),500);}
+async function promoteRepair(id){if(!confirm('Replace current/ with this repair result? Existing current/ will be backed up.'))return;const r=await api('/api/repairs/promote',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dir:current,job_id:id})});if(!r.ok)alert(r.error||'failed');else alert('Promoted. Backup: '+r.backup);}
+async function viewRepairLog(name){const txt=await api('/api/log?dir='+encodeURIComponent(current)+'&name='+encodeURIComponent(name));document.getElementById('repairLog').innerHTML='<div class="panel"><pre>'+h(txt)+'</pre></div>';}
 
 async function renderSettings(){
   cfgCache=await api('/api/config?dir='+encodeURIComponent(current));
@@ -1183,6 +1630,7 @@ async function renderSettings(){
     +lf('maxVer','<input id="c_versions" type="number" value="'+c.project.max_versions+'" '+dis+'>')+'</div>'
     +'<div class="row">'+lf('provider','<input id="c_provider" value="'+h(c.provider.name)+'" '+dis+'>')
     +lf('providerCmd','<input id="c_pcmd" value="'+h(c.provider.command)+'" placeholder="claude / codex / gemini" '+dis+'>')+'</div>'
+    +providerConfigHtml(c,locked)
     +'<div class="row">'+lf('model','<input id="c_model" value="'+h(c.provider.model)+'" '+dis+'>')
     +lf('reviewTh','<input id="c_review" type="number" value="'+c.review.threshold+'" '+dis+'>')+'</div>'
     +'<div class="row">'+lf('valueTh','<input id="c_value" type="number" value="'+c.value.threshold+'" '+dis+'>')
@@ -1200,6 +1648,14 @@ async function renderSettings(){
     +'<div style="margin-top:6px"><span class="muted" style="font-size:12px">'+t('reqTokens')+'</span><div class="chips" id="reqChips"></div><div id="reqStatus" class="hint"></div>'
     +'<div style="margin-top:6px"><span class="linklike" onclick="showHelp()">'+t('phHelpLink')+'</span></div></div></div>'
     +(locked?'':'<div style="display:flex;gap:10px;align-items:center"><button id="saveBtn" onclick="saveSettings()">'+t('save')+'</button><span id="savemsg" class="muted"></span></div>');
+}
+function providerConfigHtml(c,locked){
+  const dis=locked?'disabled':'';const profiles=(c.provider&&c.provider.profiles)||{};const assignments=(c.provider&&c.provider.assignments)||{};
+  let html='<div class="provider-box"><h4>CLI profiles & Agent routing</h4>';
+  ['claude','codex','gemini'].forEach(n=>{const p=profiles[n]||{};html+='<div class="row"><div><label>'+n+' command</label><input id="prof_'+n+'_cmd" value="'+h(p.command||'')+'" placeholder="'+n+'" '+dis+'></div><div><label>'+n+' model</label><input id="prof_'+n+'_model" value="'+h(p.model||'')+'" '+dis+'></div></div>';});
+  html+='<div class="steptable"><div class="grouphdr">Agent CLI</div>';
+  PROVIDER_AGENTS.forEach(k=>{const cur=assignments[k]||c.provider.name||'claude';html+='<div class="step-row"><span class="sa">Agent'+h(k.toUpperCase())+'</span><select id="assign_'+k+'" '+dis+'>'+['claude','codex','gemini'].map(n=>'<option value="'+n+'" '+(n===cur?'selected':'')+'>'+n+'</option>').join('')+'</select></div>';});
+  return html+'</div></div>';
 }
 function stepsHtml(c,locked){
   const ov=(c.pipeline&&c.pipeline.steps)||{};
@@ -1288,8 +1744,10 @@ async function saveSettings(){
     return;
   }
   const steps={};['arch','goal_check','test_agent','doc','scout','evaluate','features_doc'].forEach(s=>{const el=document.getElementById('step_'+s);if(el)steps[s]=el.checked;});
+  const profiles={};['claude','codex','gemini'].forEach(n=>{profiles[n]={command:val('prof_'+n+'_cmd'),model:val('prof_'+n+'_model'),extra_args:[]};});
+  const assignments={};PROVIDER_AGENTS.forEach(k=>{const el=document.getElementById('assign_'+k);assignments[k]=el?el.value:'claude';});
   const config={project:{max_versions:parseInt(val('c_versions')||'6')},
-    provider:{name:val('c_provider'),command:val('c_pcmd'),model:val('c_model')},
+    provider:{name:val('c_provider'),command:val('c_pcmd'),model:val('c_model'),profiles:profiles,assignments:assignments},
     pipeline:{mode:document.getElementById('c_mode').value,steps:steps},
     agents:{max_parallel:parseInt(val('c_par')||'3'),retries:parseInt(val('c_retries')||'3')},
     review:{threshold:parseInt(val('c_review')||'80')},value:{threshold:parseInt(val('c_value')||'65')},

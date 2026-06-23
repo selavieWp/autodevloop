@@ -192,9 +192,15 @@ def _invoke_once(
             "and add it to PATH, or change the provider command in settings."
         ) from exc
 
+    stdout_chunks: list[str] = []
     stderr_lines: list[str] = []
     last_activity = [time.time()]
-    done = threading.Event()
+
+    def drain_stdout() -> None:
+        assert process.stdout is not None
+        while chunk := process.stdout.read(8192):
+            stdout_chunks.append(chunk)
+            last_activity[0] = time.time()
 
     def drain_stderr() -> None:
         assert process.stderr is not None
@@ -212,12 +218,13 @@ def _invoke_once(
         try:
             process.stdin.write(prompt)
             process.stdin.close()
-        except (BrokenPipeError, OSError):
+        except (BrokenPipeError, OSError, ValueError):
             pass
 
     # No periodic heartbeat events: the dashboard shows a live per-agent timer
     # client-side. We only surface meaningful tool-activity lines via on_status.
     threads = [
+        threading.Thread(target=drain_stdout, daemon=True),
         threading.Thread(target=drain_stderr, daemon=True),
         threading.Thread(target=feed_stdin, daemon=True),
     ]
@@ -225,13 +232,18 @@ def _invoke_once(
         thread.start()
 
     try:
-        stdout, _ = process.communicate(timeout=timeout)
+        process.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
         process.kill()
-        done.set()
+        process.wait()
         raise TransientError(f"{label}: provider timed out after {timeout}s")
     finally:
-        done.set()
+        # Once the child exits, both pipes reach EOF. Wait for the drainers so
+        # parsing and error reporting always see the complete provider output.
+        for thread in threads:
+            thread.join()
+
+    stdout = "".join(stdout_chunks)
 
     stderr_text = "\n".join(stderr_lines)
     if process.returncode != 0:

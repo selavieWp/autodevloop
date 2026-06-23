@@ -7,10 +7,10 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from . import __version__
+from . import __version__, control, repair
 from .config import deep_get, deep_merge, load_config, save_config
 from .engine import AutoDevLoop
-from .util import APP_DIR, STATE_FILE, STOP_FILE, load_json, now_text, write_text
+from .util import APP_DIR, STATE_FILE, STOP_FILE, load_json, now_text, save_json, write_text
 
 
 def resolve_project_dir(raw: str | None, base_dir: Path | None = None) -> Path:
@@ -122,8 +122,8 @@ def cmd_run(args: argparse.Namespace) -> None:
     brainstorm_on = bool(deep_get(config, "project.brainstorm", False)) and not args.no_brainstorm
     if brainstorm_on and not args.non_interactive and goal:
         from . import brainstorm
-        from .config import provider_invocation
-        refined_goal, arch_hint = brainstorm.run_cli_session(provider_invocation(config), root, goal)
+        from .config import provider_for_agent
+        refined_goal, arch_hint = brainstorm.run_cli_session(provider_for_agent(config, "brainstorm"), root, goal)
         goal = refined_goal or goal
         if arch_hint:
             existing_hint = deep_get(config, "project.arch_hint", "")
@@ -147,6 +147,53 @@ def cmd_stop(args: argparse.Namespace) -> None:
     print(f"[AutoDevLoop] Stop requested: {app_dir / STOP_FILE}")
 
 
+def cmd_pause(args: argparse.Namespace) -> None:
+    root = resolve_project_dir(args.project_dir)
+    app_dir = root / APP_DIR
+    cp = control.load_checkpoint(app_dir)
+    if not cp:
+        raise SystemExit("[AutoDevLoop] No resumable checkpoint found.")
+    control.terminate_process_tree(None, app_dir, root)
+    target = Path(cp.get("working_dir")) if cp.get("run_type") == "repair" and cp.get("working_dir") else root / "current"
+    control.restore_active(app_dir, target)
+    cp["status"] = "paused"
+    cp["pause_reason"] = "Paused from CLI; in-flight agent output was discarded"
+    control.save_checkpoint(app_dir, cp)
+    state = load_json(app_dir / STATE_FILE, {})
+    if cp.get("run_type") == "repair":
+        job = repair.load_job(root, str(cp.get("job_id") or ""))
+        if job:
+            job["status"] = "paused"
+            repair.save_job(root, job)
+    else:
+        state["status"] = "paused"
+        state["stop_reason"] = cp["pause_reason"]
+        save_json(app_dir / STATE_FILE, state)
+        control.write_progress_doc(root, cp, state)
+    print(f"[AutoDevLoop] Paused. Next agent: {cp.get('next_agent', 'unknown')}")
+
+
+def cmd_resume(args: argparse.Namespace) -> None:
+    root = resolve_project_dir(args.project_dir)
+    cp = control.load_checkpoint(root / APP_DIR)
+    if cp.get("run_type") == "repair":
+        repair.run_job(root, str(cp.get("job_id") or ""))
+        return
+    config = load_config(root)
+    state = load_json(root / APP_DIR / STATE_FILE, {})
+    goal = deep_get(config, "project.goal", "") or state.get("goal", "")
+    AutoDevLoop(root, config).run(
+        reset=False, goal=goal,
+        project_name=state.get("project_name") or deep_get(config, "project.name", "") or root.name,
+        max_versions=int(state.get("max_versions") or deep_get(config, "project.max_versions", 5)),
+    )
+
+
+def cmd_repair_run(args: argparse.Namespace) -> None:
+    root = resolve_project_dir(args.project_dir)
+    repair.run_job(root, args.job_id)
+
+
 def cmd_status(args: argparse.Namespace) -> None:
     root = resolve_project_dir(args.project_dir)
     state = load_json(root / APP_DIR / STATE_FILE, {})
@@ -167,6 +214,9 @@ def cmd_status(args: argparse.Namespace) -> None:
     print(f"  Cost    : ${cost.get('cost_usd_total', 0):.4f} | "
           f"in {cost.get('input_tokens', 0)} / out {cost.get('output_tokens', 0)} tokens")
     print(f"  Updated : {state.get('updated_at')}")
+    cp = control.load_checkpoint(root / APP_DIR)
+    if cp:
+        print(f"  Resume  : {cp.get('run_type')} v{cp.get('version')} | next {cp.get('next_agent')}")
     print()
 
 
@@ -216,6 +266,19 @@ def build_parser() -> argparse.ArgumentParser:
     stop = sub.add_parser("stop", help="Request a running loop to stop.")
     _add_project_dir(stop)
     stop.set_defaults(func=cmd_stop)
+
+    pause = sub.add_parser("pause", help="Immediately pause and discard only the in-flight agent.")
+    _add_project_dir(pause)
+    pause.set_defaults(func=cmd_pause)
+
+    resume = sub.add_parser("resume", help="Resume from the last successful agent checkpoint.")
+    _add_project_dir(resume)
+    resume.set_defaults(func=cmd_resume)
+
+    repair_run = sub.add_parser("repair-run", help="Internal worker for a saved repair job.")
+    _add_project_dir(repair_run)
+    repair_run.add_argument("--job-id", required=True)
+    repair_run.set_defaults(func=cmd_repair_run)
 
     status = sub.add_parser("status", help="Print run state summary.")
     _add_project_dir(status)

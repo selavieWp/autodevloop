@@ -233,6 +233,17 @@ provider:
   command: ""           # blank = use the profile's default command (e.g. "claude")
   model: ""             # optional model alias/name
   extra_args: []        # extra CLI args appended to every call
+  profiles:
+    claude: {command: "", model: ""}
+    codex: {command: "", model: ""}
+    gemini: {command: "", model: ""}
+  assignments:          # blank/missing = inherit provider.name
+    arch: codex
+    plan: codex
+    dev: claude
+    review: codex
+    bugfix: claude
+    bugverify: codex
 
 pipeline:
   mode: advanced        # simple | advanced
@@ -271,6 +282,29 @@ vcs:
 Useful CLI flags: `--mode`, `--provider`, `--provider-command`, `--model`,
 `--max-versions`, `--review-threshold`, `--fix-retries`, `--max-parallel-agents`,
 `--no-parallel`, `--no-git`, `--test-command`, `--reset`, `--non-interactive`.
+
+---
+
+## Agent checkpoints, repairs, and CLI routing
+
+The dashboard now has four distinct controls. **Pause agent** kills the active
+CLI process tree, discards only that in-flight agent (or parallel DEV batch),
+and preserves completed agents in `.autodev/checkpoint.json`. **Continue**
+restarts at that exact agent. Graceful stop still finishes the current version;
+discard-version stop rolls `current/` back to the last completed version.
+
+`docs/development-progress.md` is the human-readable checkpoint. While paused,
+you can add highest-priority human directives for the next agent, this version,
+or all future versions; their audit trail lives in `.autodev/directives.json`.
+
+The **Bug repair** tab creates immutable branches such as
+`repairs/v2/fix-001/`, then runs BugFix, tests, and BugVerify without changing
+`versions/v2/`. Accepted repairs can optionally be promoted to `current/` after
+the existing working copy is backed up.
+
+Settings can independently route each agent role to Claude, Codex, or Gemini.
+Dynamic development agents inherit the DEV assignment. Blank assignments
+inherit the legacy default provider, keeping old projects compatible.
 
 ---
 

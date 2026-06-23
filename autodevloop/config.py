@@ -47,6 +47,11 @@ PROVIDER_PROFILES: dict[str, dict[str, Any]] = {
     },
 }
 
+AGENT_PROVIDER_KEYS = (
+    "brainstorm", "arch", "plan", "dev", "doc", "test", "review", "fix",
+    "goal_check", "scout", "evaluate", "bugfix", "bugverify",
+)
+
 # Steps enabled per mode. Web/CLI may override individual steps.
 SIMPLE_STEPS = {
     "arch": True,
@@ -82,6 +87,12 @@ def default_config() -> dict[str, Any]:
             "command": "",          # blank -> use profile command
             "model": "",
             "extra_args": [],
+            "profiles": {
+                name: {"command": "", "model": "", "extra_args": []}
+                for name in PROVIDER_PROFILES
+            },
+            # blank means inherit provider.name (keeps old single-provider configs)
+            "assignments": {key: "" for key in AGENT_PROVIDER_KEYS},
         },
         "pipeline": {
             "mode": "advanced",     # "simple" | "advanced"
@@ -145,11 +156,25 @@ def resolved_steps(config: dict[str, Any]) -> dict[str, bool]:
 
 
 def provider_invocation(config: dict[str, Any]) -> dict[str, Any]:
-    name = str(deep_get(config, "provider.name", "claude")).lower()
+    return provider_for_agent(config, "")
+
+
+def provider_for_agent(config: dict[str, Any], agent_key: str) -> dict[str, Any]:
+    """Resolve a CLI profile for one pipeline role, preserving old configs."""
+    default_name = str(deep_get(config, "provider.name", "claude")).lower()
+    assigned = deep_get(config, f"provider.assignments.{agent_key}", "") if agent_key else ""
+    name = str(assigned or default_name).lower()
+    if name not in PROVIDER_PROFILES:
+        name = default_name if default_name in PROVIDER_PROFILES else "claude"
     profile = copy.deepcopy(PROVIDER_PROFILES.get(name, PROVIDER_PROFILES["claude"]))
-    command = deep_get(config, "provider.command", "") or profile["command"]
-    extra = deep_get(config, "provider.extra_args", []) or []
-    model = deep_get(config, "provider.model", "")
+    configured = deep_get(config, f"provider.profiles.{name}", {}) or {}
+    # Legacy command/model remain the default provider's overrides.
+    legacy_command = deep_get(config, "provider.command", "") if name == default_name else ""
+    legacy_model = deep_get(config, "provider.model", "") if name == default_name else ""
+    legacy_extra = deep_get(config, "provider.extra_args", []) if name == default_name else []
+    command = configured.get("command") or legacy_command or profile["command"]
+    model = configured.get("model") or legacy_model or ""
+    extra = configured.get("extra_args") or legacy_extra or []
     profile["command"] = command
     profile["extra_args"] = list(extra)
     profile["model"] = model

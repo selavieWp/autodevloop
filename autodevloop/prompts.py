@@ -271,6 +271,42 @@ Root cause: [...]
 Fix applied: [...]
 Verified by: [...]
 """.strip(),
+    "bugfix": """
+You are AgentBUGFIX repairing a released project snapshot based on version {{version}}.
+
+Human-reported bug or optimization request:
+{{request}}
+
+Previous validation feedback:
+{{feedback}}
+
+Current project context:
+{{context}}
+
+Work directly in this repair workspace. Diagnose the request, make the smallest
+safe change that fully solves it, and preserve unrelated behavior. End with a
+concise SUMMARY of changed files and verification performed.
+""".strip(),
+    "bugverify": """
+You are AgentBUGVERIFY. Decide whether a repair actually satisfies the human request.
+
+Selected base version: {{version}}
+Human request:
+{{request}}
+Test result:
+{{test_result}}
+Changed files:
+{{diff}}
+Current project context:
+{{context}}
+
+Return ONLY JSON:
+{
+  "accepted": false,
+  "reason": "...",
+  "remaining_issues": ["..."]
+}
+""".strip(),
     "scout": """
 You are AgentSCOUT for version v{{version}}. The core user goal is already
 met, so propose genuinely valuable NEW features that extend the product into
@@ -359,6 +395,8 @@ REQUIRED_TOKENS: dict[str, list[str]] = {
     "review": ["{{version}}", "{{goal}}", "{{plan}}", "{{test_result}}", "{{context}}",
                "score", "goal_met", "goal_progress", "feature_summary", "whats_new"],
     "fix": ["{{version}}", "{{goal}}", "{{plan}}", "{{test_result}}", "{{review}}"],
+    "bugfix": ["{{version}}", "{{request}}", "{{feedback}}", "{{context}}"],
+    "bugverify": ["{{version}}", "{{request}}", "{{test_result}}", "{{diff}}", "{{context}}", "accepted"],
     "scout": ["{{goal}}", "{{review}}", "{{context}}", "candidates"],
     "evaluate": ["{{goal}}", "{{candidates}}", "{{threshold}}", "evaluations", "value", "accepted"],
     "goal_check": ["{{goal}}", "{{review}}", "{{context}}", "goal_met", "goal_progress"],

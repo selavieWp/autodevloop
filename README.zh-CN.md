@@ -201,6 +201,17 @@ provider:
   command: ""           # 留空 = 使用该 provider 的默认命令（如 "claude"）
   model: ""             # 可选的模型别名/名称
   extra_args: []        # 每次调用都附加的额外 CLI 参数
+  profiles:
+    claude: {command: "", model: ""}
+    codex: {command: "", model: ""}
+    gemini: {command: "", model: ""}
+  assignments:          # 留空/缺失时继承 provider.name
+    arch: codex
+    plan: codex
+    dev: claude
+    review: codex
+    bugfix: claude
+    bugverify: codex
 
 pipeline:
   mode: advanced        # simple | advanced
@@ -239,6 +250,26 @@ vcs:
 常用 CLI 参数：`--mode`、`--provider`、`--provider-command`、`--model`、
 `--max-versions`、`--review-threshold`、`--fix-retries`、`--max-parallel-agents`、
 `--no-parallel`、`--no-git`、`--test-command`、`--reset`、`--non-interactive`。
+
+---
+
+## Agent 级断点、Bug 修复与 CLI 分配
+
+面板现在有四种互不冲突的控制。**暂停当前 Agent** 会终止正在运行的 CLI
+进程树，只废弃当前 Agent（并行开发时废弃整个 DEV 批次），并把此前完成的
+Agent 保存在 `.autodev/checkpoint.json`。点击**继续**会从该 Agent 重新开始。
+优雅停止仍会完成当前版本后停止；废弃本版仍会回退到上一个完整版本。
+
+人类可读进度保存在 `docs/development-progress.md`。暂停后可以补充只影响下一个
+Agent、当前版本或所有后续版本的最高优先级指令，审计记录保存在
+`.autodev/directives.json`。
+
+**Bug 修复** Tab 会创建 `repairs/v2/fix-001/` 这样的独立分支，依次执行
+BugFix、测试和 BugVerify，原始 `versions/v2/` 不会改变。验收通过后可以手动
+提升为 `current/`，提升前会备份原工作副本。
+
+设置页可以为每个 Agent 角色分别选择 Claude、Codex 或 Gemini。动态
+`AgentDEV_*` 继承 DEV 的选择；空分配继承旧版默认 Provider，旧项目无需迁移。
 
 ---
 
