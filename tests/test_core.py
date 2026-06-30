@@ -14,7 +14,7 @@ from autodevloop.config import default_config, load_config, resolved_steps, prov
 from autodevloop.engine import AutoDevLoop
 from autodevloop.llm import call
 from autodevloop.prompts import DEFAULT_TEMPLATES, render
-from autodevloop.util import extract_json, diff_file_lists, load_json, save_json, slugify
+from autodevloop.util import extract_json, diff_file_lists, load_json, normalize_project_path, save_json, slugify
 
 
 def test_yaml_round_trip():
@@ -23,6 +23,27 @@ def test_yaml_round_trip():
     assert back["pipeline"]["mode"] == "advanced"
     assert back["agents"]["allow_parallel"] is True
     assert back["review"]["threshold"] == 80
+
+
+def test_fallback_yaml_parses_empty_flow_map(monkeypatch):
+    monkeypatch.setattr(yaml_compat, "_pyyaml", None)
+
+    data = yaml_compat.load("pipeline:\n  steps: {}\n")
+
+    assert data["pipeline"]["steps"] == {}
+
+
+def test_wsl_unc_project_paths_normalize_to_linux_paths():
+    if os.name == "nt":
+        return
+
+    direct = normalize_project_path(r"\\wsl.localhost\Ubuntu\home\wangpeng\projects\auto_test\test1")
+    embedded = normalize_project_path(
+        r"/home/wangpeng/projects/autodev/\\wsl.localhost\Ubuntu\home\wangpeng\projects\auto_test\test1"
+    )
+
+    assert str(direct) == "/home/wangpeng/projects/auto_test/test1"
+    assert embedded == direct
 
 
 def test_modes_resolve_steps():

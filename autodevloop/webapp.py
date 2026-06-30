@@ -13,6 +13,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -21,9 +22,9 @@ from urllib.parse import parse_qs, urlparse
 from . import prompts, registry, control, repair
 from .config import deep_merge, load_config, save_config, deep_get
 from .util import (
-    APP_DIR, PROGRESS_FILE, STATE_FILE, STOP_FILE,
+    APP_DIR, CONFIG_FILE, PROGRESS_FILE, STATE_FILE, STOP_FILE,
     load_json, now_text, read_text, restore_working_dir, rmtree_robust,
-    save_json, write_text,
+    save_json, write_text, normalize_project_path,
 )
 
 _RUNS: dict[str, subprocess.Popen] = {}
@@ -60,11 +61,109 @@ def _safe_within(root: Path, candidate: Path) -> bool:
         return False
 
 
+def _project_root(value: str | os.PathLike[str]) -> Path:
+    return normalize_project_path(value)
+
+
+def _literal_root(value: str | os.PathLike[str]) -> Path:
+    return Path(str(value or "")).expanduser().resolve()
+
+
+def _migrate_misparsed_wsl_project(raw_dir: str, root: Path) -> None:
+    """Carry config forward from a path previously misread as a literal name."""
+    literal = _literal_root(raw_dir)
+    if literal == root or not literal.exists() or (root / CONFIG_FILE).exists():
+        return
+    lowered = str(raw_dir).lower()
+    if "wsl.localhost" not in lowered and "wsl$" not in lowered:
+        return
+    source_config = literal / CONFIG_FILE
+    if not source_config.exists():
+        return
+    root.mkdir(parents=True, exist_ok=True)
+    write_text(root / CONFIG_FILE, read_text(source_config))
+    for rel in (Path("docs") / "brainstorm-spec.md", Path("docs") / "brainstorm-history.md"):
+        source = literal / rel
+        target = root / rel
+        if source.exists() and not target.exists():
+            write_text(target, read_text(source))
+
+
+def _progress_event(step: str, message: str, *, log: str = "", snippet: str = "") -> dict[str, Any]:
+    event = {"time": now_text(), "step": step, "agent": "", "message": message}
+    if log:
+        event["log"] = log
+    if snippet:
+        event["snippet"] = snippet
+    return event
+
+
+def _tail_text(path: Path, limit: int = 900) -> str:
+    text = read_text(path).strip()
+    if len(text) <= limit:
+        return text
+    return text[-limit:].lstrip()
+
+
+def _mark_run_launched(root: Path, pid: int, goal: str, config: dict[str, Any]) -> None:
+    app_dir = root / APP_DIR
+    state = load_json(app_dir / STATE_FILE, {})
+    if not isinstance(state, dict):
+        state = {}
+    state.update({
+        "status": "running",
+        "goal": state.get("goal") or goal,
+        "project_name": state.get("project_name") or deep_get(config, "project.name", root.name),
+        "current_version": int(state.get("current_version", 0) or 0),
+        "max_versions": int(state.get("max_versions") or deep_get(config, "project.max_versions", 0) or 0),
+    })
+    save_json(app_dir / STATE_FILE, state)
+
+    progress = load_json(app_dir / PROGRESS_FILE, {})
+    if not isinstance(progress, dict):
+        progress = {}
+    progress.update({
+        "status": "running",
+        "active": [],
+        "run_started_at": progress.get("run_started_at") or now_text(),
+        "run_started_ts": progress.get("run_started_ts") or time.time(),
+        "run_ended_at": None,
+        "run_ended_ts": None,
+    })
+    progress.setdefault("events", []).append(_progress_event("START", f"run process launched (pid {pid})"))
+    save_json(app_dir / PROGRESS_FILE, progress, stamp=False)
+
+
+def _mark_run_failed(root: Path, return_code: int) -> None:
+    app_dir = root / APP_DIR
+    state = load_json(app_dir / STATE_FILE, {})
+    if isinstance(state, dict) and state.get("status") in {"stopped", "paused", "completed"}:
+        return
+    message = f"run process exited with code {return_code}"
+    if not isinstance(state, dict):
+        state = {}
+    state["status"] = "failed"
+    state["error"] = message
+    save_json(app_dir / STATE_FILE, state)
+
+    progress = load_json(app_dir / PROGRESS_FILE, {})
+    if not isinstance(progress, dict):
+        progress = {}
+    progress["status"] = "failed"
+    progress["active"] = []
+    progress["run_ended_at"] = now_text()
+    progress["run_ended_ts"] = time.time()
+    progress.setdefault("events", []).append(
+        _progress_event("FAILED", message, log="web_run.log", snippet=_tail_text(app_dir / "web_run.log"))
+    )
+    save_json(app_dir / PROGRESS_FILE, progress, stamp=False)
+
+
 # --------------------------------------------------------------------------- #
 # Run process tracking
 # --------------------------------------------------------------------------- #
 def _is_running(dir_str: str) -> bool:
-    root = Path(dir_str).resolve()
+    root = _project_root(dir_str)
     with _LOCK:
         proc = _RUNS.get(str(root))
     return (proc is not None and proc.poll() is None) or control.persisted_process_alive(root / APP_DIR, root)
@@ -98,13 +197,17 @@ def _watch_run(root: Path, proc: subprocess.Popen, log_file: Any) -> None:
         proc.kill()
     except Exception:  # noqa: BLE001
         pass
+    if proc.returncode:
+        _mark_run_failed(root, int(proc.returncode))
 
 
 # --------------------------------------------------------------------------- #
 # Project summaries / config
 # --------------------------------------------------------------------------- #
 def _project_summary(entry: dict[str, Any]) -> dict[str, Any]:
-    root = Path(entry["dir"])
+    root = _project_root(entry["dir"])
+    if entry.get("_raw_dir"):
+        _migrate_misparsed_wsl_project(str(entry["_raw_dir"]), root)
     state = load_json(root / APP_DIR / STATE_FILE, {})
     config = load_config(root)
     running = _is_running(str(root))
@@ -128,7 +231,7 @@ def _create_project(payload: dict[str, Any]) -> dict[str, Any]:
         return {"ok": False, "error": "project directory is required"}
     if not goal:
         return {"ok": False, "error": "goal is required"}
-    root = Path(raw_dir).expanduser().resolve()
+    root = _project_root(raw_dir)
     root.mkdir(parents=True, exist_ok=True)
 
     config = load_config(root)
@@ -160,13 +263,13 @@ def _delete_project(payload: dict[str, Any]) -> dict[str, Any]:
     raw_dir = str(payload.get("dir") or "").strip()
     if not raw_dir:
         return {"ok": False, "error": "project directory is required"}
-    root = Path(raw_dir).expanduser().resolve()
+    root = _project_root(raw_dir)
     if str(payload.get("confirm_dir") or "") != str(root):
         return {"ok": False, "error": "project directory confirmation did not match"}
 
     registered = any(
         str(entry.get("dir") or "").strip()
-        and Path(str(entry["dir"])).expanduser().resolve() == root
+        and _project_root(str(entry["dir"])) == root
         for entry in registry.load()
     )
     if not registered:
@@ -206,7 +309,7 @@ def _brainstorm_turn(payload: dict[str, Any]) -> dict[str, Any]:
     raw_dir = str(payload.get("dir") or "").strip()
     if not raw_dir:
         return {"ok": False, "error": "dir required"}
-    root = Path(raw_dir).expanduser().resolve()
+    root = _project_root(raw_dir)
     app_dir = root / APP_DIR
     app_dir.mkdir(parents=True, exist_ok=True)
     config = load_config(root)
@@ -240,7 +343,7 @@ def _brainstorm_design(dir_str: str) -> dict[str, Any]:
     """Return the persisted design, history and whether the design is editable."""
     from . import brainstorm
 
-    root = Path(dir_str).expanduser().resolve()
+    root = _project_root(dir_str)
     app_dir = root / APP_DIR
     session = brainstorm.load_session(app_dir)
     spec = str(session.get("spec") or "").strip()
@@ -278,7 +381,7 @@ def _save_brainstorm_design(payload: dict[str, Any]) -> dict[str, Any]:
         return {"ok": False, "error": "project directory is required"}
     if not spec:
         return {"ok": False, "error": "design cannot be empty"}
-    root = Path(raw_dir).expanduser().resolve()
+    root = _project_root(raw_dir)
     design = _brainstorm_design(str(root))
     if not design.get("exists"):
         return {"ok": False, "error": "no completed brainstorm design exists"}
@@ -308,7 +411,8 @@ def _start_run(payload: dict[str, Any]) -> dict[str, Any]:
     raw_dir = str(payload.get("dir") or "").strip()
     if not raw_dir:
         return {"ok": False, "error": "project directory is required"}
-    root = Path(raw_dir).expanduser().resolve()
+    root = _project_root(raw_dir)
+    _migrate_misparsed_wsl_project(raw_dir, root)
     if _is_running(str(root)):
         return {"ok": False, "error": "a run is already active for this project"}
 
@@ -337,6 +441,7 @@ def _start_run(payload: dict[str, Any]) -> dict[str, Any]:
         popen_opts["start_new_session"] = True
     proc = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT, cwd=pkg_root, env=env, **popen_opts)
     control.write_run_control(root / APP_DIR, proc.pid, root)
+    _mark_run_launched(root, proc.pid, goal, config)
     with _LOCK:
         _RUNS[str(root)] = proc
     threading.Thread(target=_watch_run, args=(root, proc, log_file), daemon=True).start()
@@ -347,7 +452,7 @@ def _pause_run(payload: dict[str, Any]) -> dict[str, Any]:
     raw_dir = str(payload.get("dir") or "").strip()
     if not raw_dir:
         return {"ok": False, "error": "dir required"}
-    root = Path(raw_dir).expanduser().resolve()
+    root = _project_root(raw_dir)
     app_dir = root / APP_DIR
     with _LOCK:
         proc = _RUNS.pop(str(root), None)
@@ -386,7 +491,7 @@ def _start_repair(payload: dict[str, Any], existing_job_id: str = "") -> dict[st
     raw_dir = str(payload.get("dir") or "").strip()
     if not raw_dir:
         return {"ok": False, "error": "dir required"}
-    root = Path(raw_dir).expanduser().resolve()
+    root = _project_root(raw_dir)
     if _is_running(str(root)):
         return {"ok": False, "error": "another project task is already active"}
     try:
@@ -414,7 +519,7 @@ def _start_repair(payload: dict[str, Any], existing_job_id: str = "") -> dict[st
 
 
 def _resume_run(payload: dict[str, Any]) -> dict[str, Any]:
-    root = Path(str(payload.get("dir") or "")).expanduser().resolve()
+    root = _project_root(str(payload.get("dir") or ""))
     cp = control.load_checkpoint(root / APP_DIR)
     if cp.get("run_type") == "repair":
         return _start_repair(payload, str(cp.get("job_id") or ""))
@@ -422,7 +527,7 @@ def _resume_run(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _promote_repair(payload: dict[str, Any]) -> dict[str, Any]:
-    root = Path(str(payload.get("dir") or "")).expanduser().resolve()
+    root = _project_root(str(payload.get("dir") or ""))
     if _is_running(str(root)) or control.load_checkpoint(root / APP_DIR).get("status") == "paused":
         return {"ok": False, "error": "stop or finish the active task before promotion"}
     return repair.promote_job(root, str(payload.get("job_id") or ""))
@@ -449,7 +554,7 @@ def _stop_run(payload: dict[str, Any]) -> dict[str, Any]:
     mode = str(payload.get("mode") or "graceful")
     if not raw_dir:
         return {"ok": False, "error": "dir required"}
-    root = Path(raw_dir).expanduser().resolve()
+    root = _project_root(raw_dir)
     app_dir = root / APP_DIR
     app_dir.mkdir(parents=True, exist_ok=True)
 
@@ -492,7 +597,7 @@ def _stop_run(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _get_config(dir_str: str) -> dict[str, Any]:
-    root = Path(dir_str).expanduser().resolve()
+    root = _project_root(dir_str)
     config = load_config(root)
     app_dir = root / APP_DIR
     prompts.ensure_templates(app_dir)
@@ -504,7 +609,7 @@ def _get_config(dir_str: str) -> dict[str, Any]:
 
 
 def _save_config(dir_str: str, payload: dict[str, Any]) -> dict[str, Any]:
-    root = Path(dir_str).expanduser().resolve()
+    root = _project_root(dir_str)
     if _is_running(str(root)):
         return {"ok": False, "error": "cannot edit settings while a run is active"}
     templates = payload.get("templates") or {}
@@ -533,14 +638,14 @@ def _save_config(dir_str: str, payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _directives_payload(dir_str: str) -> dict[str, Any]:
-    root = Path(dir_str).expanduser().resolve()
+    root = _project_root(dir_str)
     state = load_json(root / APP_DIR / STATE_FILE, {})
     return {"directives": control.load_directives(root / APP_DIR),
             "version": int(state.get("current_version", 0) or 0) + 1}
 
 
 def _save_directive(payload: dict[str, Any]) -> dict[str, Any]:
-    root = Path(str(payload.get("dir") or "")).expanduser().resolve()
+    root = _project_root(str(payload.get("dir") or ""))
     app_dir = root / APP_DIR
     state = load_json(app_dir / STATE_FILE, {})
     if payload.get("id"):
@@ -582,10 +687,10 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/brainstorm/design":
             return _json_response(self, _brainstorm_design(self._query().get("dir", "")))
         if path == "/api/state":
-            root = Path(self._query().get("dir", ""))
+            root = _project_root(self._query().get("dir", ""))
             return _json_response(self, load_json(root / APP_DIR / STATE_FILE, {}))
         if path == "/api/progress":
-            root = Path(self._query().get("dir", ""))
+            root = _project_root(self._query().get("dir", ""))
             prog = load_json(root / APP_DIR / PROGRESS_FILE, {})
             if isinstance(prog, dict):
                 prog["running"] = _is_running(str(root))
@@ -593,12 +698,12 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/config":
             return _json_response(self, _get_config(self._query().get("dir", "")))
         if path == "/api/checkpoint":
-            root = Path(self._query().get("dir", "")).resolve()
+            root = _project_root(self._query().get("dir", ""))
             return _json_response(self, control.load_checkpoint(root / APP_DIR))
         if path == "/api/directives":
             return _json_response(self, _directives_payload(self._query().get("dir", "")))
         if path == "/api/repairs":
-            root = Path(self._query().get("dir", "")).resolve()
+            root = _project_root(self._query().get("dir", ""))
             return _json_response(self, {"jobs": repair.list_jobs(root)})
         if path == "/api/log":
             return self._serve_log()
@@ -637,16 +742,21 @@ class Handler(BaseHTTPRequestHandler):
 
     def _serve_log(self) -> None:
         q = self._query()
-        root = Path(q.get("dir", "")).resolve()
+        root = _project_root(q.get("dir", ""))
         name = q.get("name", "")
-        target = root / APP_DIR / "logs" / name
-        if not name or not _safe_within(root / APP_DIR / "logs", target) or not target.exists():
+        if name == "web_run.log":
+            target = root / APP_DIR / name
+            allowed = target.exists()
+        else:
+            target = root / APP_DIR / "logs" / name
+            allowed = bool(name) and _safe_within(root / APP_DIR / "logs", target) and target.exists()
+        if not allowed:
             return _text_response(self, "(log not found)")
         return _text_response(self, read_text(target))
 
     def _serve_doc(self) -> None:
         q = self._query()
-        root = Path(q.get("dir", "")).resolve()
+        root = _project_root(q.get("dir", ""))
         which = q.get("name", "changelog")
         mapping = {"changelog": root / "CHANGELOG.md", "features": root / "FEATURES.md",
                    "brainstorm-spec": root / "docs" / "brainstorm-spec.md",
@@ -1473,7 +1583,7 @@ async function pollDashboard(force){
   lastProgress=p; const running=!!p.running;
   const br=document.getElementById('btnRun'),bc=document.getElementById('btnResume'),bp=document.getElementById('btnPause'),bg=document.getElementById('btnStopG'),bi=document.getElementById('btnStopI');
   const paused=(p.status==='paused');
-  if(br){br.disabled=running||paused;bc.disabled=running||!paused;bp.disabled=!running;bg.disabled=!running;bi.disabled=!(running||paused);}
+  if(br){br.textContent=t('run');br.disabled=running||paused;bc.disabled=running||!paused;bp.disabled=!running;bg.disabled=!running;bi.disabled=!(running||paused);}
   const cls=running?'run':((p.status||'').startsWith('completed')?'ok':(p.status==='failed'?'bad':(p.status==='stopped'?'warn':'')));
   const gp=p.goal_progress||0,tk=p.tokens||{};
   const cards=document.getElementById('cards');
@@ -1552,9 +1662,11 @@ function tickTimers(){
 
 async function doRun(skipDesignSave){
   if(!skipDesignSave&&document.getElementById('designEditor')){const saved=await saveBrainstormDesign(false);if(!saved)return;}
+  const br=document.getElementById('btnRun');if(br){br.disabled=true;br.textContent='▶ '+t('st_running');}
   const r=await api('/api/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dir:current})});
-  if(!r.ok){alert(r.error||'failed');return;}
-  await renderBrainstormDesign();setTimeout(()=>pollDashboard(true),600);
+  if(!r.ok){if(br){br.disabled=false;br.textContent=t('run');}alert(r.error||'failed');return;}
+  if(r.dir)current=r.dir;
+  await loadProjects();await renderBrainstormDesign();await pollDashboard(true);setTimeout(()=>pollDashboard(true),600);
 }
 async function doPause(){const r=await api('/api/pause',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dir:current})});if(!r.ok)alert(r.error||'failed');setTimeout(()=>pollDashboard(true),300);}
 async function doResume(){const r=await api('/api/resume',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dir:current})});if(!r.ok)alert(r.error||'failed');setTimeout(()=>pollDashboard(true),500);}

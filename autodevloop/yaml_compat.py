@@ -30,6 +30,18 @@ def _scalar(raw: str) -> Any:
         if not inner:
             return []
         return [_scalar(part) for part in _split_flow(inner)]
+    if value.startswith("{") and value.endswith("}"):
+        inner = value[1:-1].strip()
+        if not inner:
+            return {}
+        result: dict[str, Any] = {}
+        for part in _split_flow(inner):
+            key, sep, raw_val = part.partition(":")
+            if not sep:
+                continue
+            parsed_key = _scalar(key.strip())
+            result[str(parsed_key)] = _scalar(raw_val.strip())
+        return result
     if (value[0] == value[-1]) and value[0] in {'"', "'"} and len(value) >= 2:
         return value[1:-1]
     try:

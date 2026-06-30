@@ -42,6 +42,39 @@ def slugify(value: str, fallback: str = "item") -> str:
     return cleaned or fallback
 
 
+def normalize_project_path(value: str | os.PathLike[str]) -> Path:
+    r"""Resolve project paths pasted from WSL-aware Windows browsers.
+
+    When the dashboard runs inside WSL, users often paste paths such as
+    ``\\wsl.localhost\Ubuntu\home\me\project`` from Explorer. On POSIX,
+    ``pathlib`` treats that as a literal relative directory name unless we
+    convert it first.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return Path("")
+
+    slash_text = text.replace("\\", "/")
+    lower = slash_text.lower()
+    for marker in ("//wsl.localhost/", "//wsl$/"):
+        idx = lower.find(marker)
+        if idx < 0:
+            continue
+        tail = slash_text[idx + len(marker):].strip("/")
+        parts = [part for part in tail.split("/") if part]
+        if len(parts) >= 2:
+            return Path("/" + "/".join(parts[1:])).expanduser().resolve()
+
+    if os.name != "nt":
+        match = re.match(r"^([A-Za-z]):[\\/](.*)$", text)
+        if match:
+            drive = match.group(1).lower()
+            rest = [part for part in re.split(r"[\\/]+", match.group(2)) if part]
+            return (Path("/mnt") / drive / Path(*rest)).expanduser().resolve()
+
+    return Path(text).expanduser().resolve()
+
+
 def write_text(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8", newline="\n")

@@ -149,6 +149,8 @@ def resolved_steps(config: dict[str, Any]) -> dict[str, bool]:
     base = ADVANCED_STEPS if mode == "advanced" else SIMPLE_STEPS
     steps = dict(base)
     overrides = deep_get(config, "pipeline.steps", {}) or {}
+    if not isinstance(overrides, dict):
+        overrides = {}
     for key, value in overrides.items():
         if key in steps and isinstance(value, bool):
             steps[key] = value
